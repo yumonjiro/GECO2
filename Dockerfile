@@ -12,8 +12,8 @@ ENV CUDA_HOME=/usr/local/cuda \
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN echo "deb http://archive.ubuntu.com/ubuntu jammy main universe restricted multiverse\n\
-deb http://archive.ubuntu.com/ubuntu jammy-updates main universe restricted multiverse\n\
-deb http://archive.ubuntu.com/ubuntu jammy-security main universe restricted multiverse" > /etc/apt/sources.list
+    deb http://archive.ubuntu.com/ubuntu jammy-updates main universe restricted multiverse\n\
+    deb http://archive.ubuntu.com/ubuntu jammy-security main universe restricted multiverse" > /etc/apt/sources.list
 
 # Install basic packages
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -39,18 +39,18 @@ RUN DEBIAN_FRONTEND=noninteractive \
     && apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/3bf863cc.pub \
     && apt-get -yq update \
     && apt-get install --no-install-recommends -yq \
-        build-essential \
-        ninja-build \
-        gcc-11 \
-        apt-transport-https \
-        ca-certificates \
-        python3 \
-        python3-dev \
-        python3-pip \
-        python3-venv \
-        ffmpeg \
-        libsm6 \
-        libxext6 \
+    build-essential \
+    ninja-build \
+    gcc-11 \
+    apt-transport-https \
+    ca-certificates \
+    python3 \
+    python3-dev \
+    python3-pip \
+    python3-venv \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -104,11 +104,12 @@ COPY --chown=user configs configs
 COPY --chown=user utils utils
 COPY --chown=user models models
 COPY --chown=user sam2 sam2
+COPY --chown=user api_server.py ./
+COPY --chown=user inference_point.py ./
 COPY --chown=user demo_gradio.py ./
 
 USER user
-# Expose the port Gradio will run on
+# Expose the port the API server will run on
 EXPOSE 7860
-ENV GRADIO_SERVER_NAME="0.0.0.0"
-# Default command to run the Gradio app
-CMD ["/opt/venv/bin/python3", "demo_gradio.py"]
+# Default command to run the FastAPI server
+CMD ["/opt/venv/bin/python3", "api_server.py"]
