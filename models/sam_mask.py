@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
+from typing import List, Optional, Tuple
 
 from sam2.sam2.modeling.sam.mask_decoder import MaskDecoder
 from sam2.sam2.modeling.sam.prompt_encoder import PromptEncoder
@@ -99,6 +100,88 @@ class MaskProcessor(nn.Module):
                     for feat, feat_size in zip(vision_feats[::-1], self._bb_feat_sizes[::-1])
                 ][::-1]
         return feats
+
+    def predict_masks_from_points(
+        self,
+        backbone_feats: dict,
+        point_coords: torch.Tensor,
+        point_labels: torch.Tensor,
+        multimask_output: bool = True,
+        mask_select_index: int = 2,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Generate segmentation masks from point prompts using pre-computed backbone features.
+
+        Args:
+            backbone_feats: Raw backbone output dict with 'vision_features', 'backbone_fpn', 'vision_pos_enc'.
+            point_coords: Point coordinates [N, 2] in pixel space (x, y), range [0, image_size].
+            point_labels: Point labels [N], 1=foreground, 0=background.
+            multimask_output: Whether to output multiple masks per point.
+            mask_select_index: Which mask to select from multimask output (default=2, usually best).
+
+        Returns:
+            masks: Binary masks [N, H, W] at image_size resolution.
+            iou_scores: IoU predictions [N] for selected masks.
+            bboxes: Bounding boxes [N, 4] in pixel space (x1, y1, x2, y2).
+        """
+        # Prepare SAM2-format features (single image)
+        features = {
+            'vision_features': backbone_feats['vision_features'][:1],
+            'vision_pos_enc': [x[:1] for x in backbone_feats['vision_pos_enc']],
+            'backbone_fpn': [x[:1].clone() for x in backbone_feats['backbone_fpn']],
+        }
+        features = self.forward_feats(features)
+
+        all_masks = []
+        all_ious = []
+        all_bboxes = []
+
+        # Process points in batches for memory efficiency
+        step = 50
+        for start in range(0, len(point_coords), step):
+            batch_coords = point_coords[start:start + step]  # [B, 2]
+            batch_labels = point_labels[start:start + step]  # [B]
+
+            # PromptEncoder expects (coords [N, P, 2], labels [N, P])
+            coords = batch_coords.unsqueeze(1)  # [B, 1, 2]
+            labels = batch_labels.unsqueeze(1)   # [B, 1]
+
+            sparse_embeddings, dense_embeddings = self.prompt_encoder_sam(
+                points=(coords, labels),
+                boxes=None,
+                masks=None,
+            )
+
+            low_res_masks, iou_predictions, _, _ = self.mask_decoder(
+                image_embeddings=features[-1],
+                image_pe=self.prompt_encoder_sam.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=multimask_output,
+                repeat_image=True,
+                high_res_features=features[:-1],
+            )
+
+            # Select best mask and upscale to full resolution
+            selected_ious = iou_predictions[:, mask_select_index]
+            masks = F.interpolate(
+                low_res_masks, (self.image_size, self.image_size),
+                mode="bilinear", align_corners=False,
+            )
+            masks = masks[:, mask_select_index] > 0  # [B, H, W]
+
+            # Extract bounding boxes from masks
+            bboxes = torch.zeros((masks.shape[0], 4), dtype=torch.float, device=masks.device)
+            for i, mask in enumerate(masks):
+                y, x = torch.where(mask)
+                if y.shape[0] > 0:
+                    bboxes[i] = torch.tensor([x.min(), y.min(), x.max(), y.max()],
+                                             dtype=torch.float, device=masks.device)
+
+            all_masks.append(masks)
+            all_ious.append(selected_ious)
+            all_bboxes.append(bboxes)
+
+        return torch.cat(all_masks), torch.cat(all_ious), torch.cat(all_bboxes)
 
     def forward(self, features_orig, outputs):
 

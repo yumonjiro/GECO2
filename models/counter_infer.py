@@ -77,10 +77,15 @@ class CNT(nn.Module):
             self.sam_mask = MaskProcessor(self.emb_dim, self.image_size, reduction)
 
 
-    def forward(self, x, bboxes):
-        self.num_objects = bboxes.size(1) 
+    def forward_backbone(self, x):
+        """Extract backbone features (shared between SAM2 preprocessing and GECO2 detection)."""
         with torch.no_grad():
             feats = self.backbone(x)
+        return feats
+
+    def forward_detect(self, feats, bboxes, image_size=1024):
+        """Run detection given pre-computed backbone features and exemplar bounding boxes."""
+        self.num_objects = bboxes.size(1)
         src = feats['vision_features']
         bs, c, w, h = src.shape
         self.reduction = 1024 / w
@@ -93,7 +98,6 @@ class CNT(nn.Module):
         ], dim=1)
         self.kernel_dim = 1
 
-        # # NORMAL
         exemplars = roi_align(
             src,
             boxes=bboxes_roi, output_size=self.kernel_dim,
@@ -102,7 +106,6 @@ class CNT(nn.Module):
 
         l1 = feats['backbone_fpn'][0]
         l2 = feats['backbone_fpn'][1]
-        r1 = 1.0 / self.reduction * 2 * 2
         exemplars_l1 = roi_align(
             l1,
             boxes=bboxes_roi, output_size=self.kernel_dim,
@@ -142,7 +145,7 @@ class CNT(nn.Module):
         adapted_f = adapted_f.view(bs, self.emb_dim, -1).permute(0, 2, 1)
         centerness = self.class_embed(adapted_f).view(bs, w, h, 1).permute(0, 3, 1, 2)
         outputs_coord = self.bbox_embed(adapted_f).sigmoid().view(bs, w, h, 4).permute(0, 3, 1, 2)
-        outputs, ref_points = boxes_with_scores(centerness, outputs_coord,sort=False, validate=True)
+        outputs, ref_points = boxes_with_scores(centerness, outputs_coord, sort=False, validate=True)
 
         if not self.validate:
             adapted_f_aux = adapted_f_aux.view(bs, self.emb_dim, -1).permute(0, 2, 1)
@@ -158,9 +161,14 @@ class CNT(nn.Module):
             masks, ious, corrected_bboxes = self.sam_mask(feats, outputs)
             for i in range(len(outputs)):
                 outputs[i]["scores"] = ious[i]
-                outputs[i]["pred_boxes"] = corrected_bboxes[i].to(outputs[i]["pred_boxes"].device).unsqueeze(0) /x.shape[ -1]
+                outputs[i]["pred_boxes"] = corrected_bboxes[i].to(outputs[i]["pred_boxes"].device).unsqueeze(0) / image_size
 
             return outputs, ref_points, centerness, outputs_coord, masks
+
+    def forward(self, x, bboxes):
+        """Full forward pass (backward-compatible). Runs backbone + detection."""
+        feats = self.forward_backbone(x)
+        return self.forward_detect(feats, bboxes, image_size=x.shape[-1])
 
 
 class MLP(nn.Module):
