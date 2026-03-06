@@ -100,6 +100,7 @@ COPY --from=build --chown=user /opt/venv /opt/venv
 
 COPY --chown=user CNTQG_multitrain_ca44.pth .
 COPY --chown=user Deformable-DETR Deformable-DETR
+COPY --chown=user Deformable-DETR/models/ops models/ops
 COPY --chown=user configs configs
 COPY --chown=user utils utils
 COPY --chown=user models models
@@ -112,4 +113,4 @@ USER user
 # Expose the port the API server will run on
 EXPOSE 7860
 # Default command to run the FastAPI server
-CMD ["/opt/venv/bin/python3", "api_server.py"]
+CMD ["python3", "api_server.py"]

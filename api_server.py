@@ -1,7 +1,10 @@
-"""FastAPI server for GECO2 point-to-count inference.
+"""FastAPI server for GECO2 (SAM2 + GECO2) point-to-count inference.
 
 Accepts an image and point prompts via HTTP, runs SAM2 mask generation + GECO2 counting,
 and returns detection results.
+
+For fully automatic counting (no user points), this service delegates point extraction
+to the AODC service configured via AODC_SERVICE_URL (default: http://aodc:7861).
 
 Usage:
     python api_server.py
@@ -11,9 +14,11 @@ Usage:
 
 import io
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import List, Optional, Tuple
 
+import httpx
 import numpy as np
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -24,10 +29,11 @@ import torchvision.ops as ops
 
 from models.counter_infer import build_model
 from models.point_to_count import PointToCountPipeline
-from models.aodc_wrapper import AODCWrapper
-from models.aodc_to_count import AutoCountPipeline
 from utils.arg_parser import get_argparser
 from utils.data import resize_and_pad
+
+# URL of the companion AODC service (override via env var for local dev)
+AODC_SERVICE_URL = os.environ.get("AODC_SERVICE_URL", "http://aodc:7861")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -36,7 +42,6 @@ logger = logging.getLogger(__name__)
 # Global state (populated on startup)
 # ---------------------------------------------------------------------------
 _pipeline: Optional[PointToCountPipeline] = None
-_auto_pipeline: Optional[AutoCountPipeline] = None
 _device: Optional[torch.device] = None
 
 
@@ -59,34 +64,14 @@ def _load_pipeline(
     return pipeline, device
 
 
-def _load_auto_pipeline(
-    ptc_pipeline: PointToCountPipeline,
-    device: torch.device,
-    aodc_checkpoint: str = "aodc.pth",
-) -> Optional[AutoCountPipeline]:
-    """Load AODC and wrap with AutoCountPipeline. Returns None if checkpoint missing."""
-    import os
-    if not os.path.exists(aodc_checkpoint):
-        logger.warning(
-            "AODC checkpoint '%s' not found — /predict_auto will be unavailable.",
-            aodc_checkpoint,
-        )
-        return None
-    logger.info("Loading AODC from %s …", aodc_checkpoint)
-    aodc = AODCWrapper(aodc_checkpoint, device)
-    return AutoCountPipeline(aodc, ptc_pipeline, device)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load model once at startup."""
-    global _pipeline, _auto_pipeline, _device
-    logger.info("Loading GECO2 pipeline …")
+    """Load SAM2+GECO2 pipeline once at startup."""
+    global _pipeline, _device
+    logger.info("Loading SAM2+GECO2 pipeline …")
     _pipeline, _device = _load_pipeline()
     logger.info("Pipeline ready on %s", _device)
-    _auto_pipeline = _load_auto_pipeline(_pipeline, _device)
-    if _auto_pipeline is not None:
-        logger.info("AutoCountPipeline (AODC→SAM2→GECO2) ready.")
+    logger.info("Auto-count will call AODC service at %s", AODC_SERVICE_URL)
     yield
     logger.info("Shutting down.")
 
@@ -241,8 +226,8 @@ async def predict_auto(
 ):
     """Run fully automatic counting — no point prompts needed.
 
-    AODC generates a density map from the image alone and extracts the top-1
-    peak as the seed point, which is then passed to the SAM2→GECO2 pipeline.
+    Delegates point extraction to the AODC service (AODC_SERVICE_URL), then
+    runs the local SAM2+GECO2 pipeline with that seed point.
 
     **Request** (multipart/form-data):
     - `image`: image file
@@ -257,12 +242,6 @@ async def predict_auto(
     }
     ```
     """
-    if _auto_pipeline is None:
-        raise HTTPException(
-            status_code=503,
-            detail="AutoCountPipeline not available: AODC checkpoint not found at startup.",
-        )
-
     try:
         contents = await image.read()
         pil = Image.open(io.BytesIO(contents)).convert("RGB")
@@ -270,7 +249,36 @@ async def predict_auto(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
 
-    pred_boxes, count, exemplar_boxes = _auto_pipeline.run(image_np, threshold=threshold)
+    # --- Call AODC service to get seed point ---
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{AODC_SERVICE_URL}/predict",
+                files={"image": (image.filename or "image.jpg", contents, "image/jpeg")},
+            )
+            resp.raise_for_status()
+            aodc_result = resp.json()
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail=f"AODC service unreachable at {AODC_SERVICE_URL}. "
+                   "Is the aodc container running?",
+        )
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"AODC service returned error: {e.response.status_code} {e.response.text}",
+        )
+
+    x, y = float(aodc_result["x"]), float(aodc_result["y"])
+
+    # --- Run local SAM2+GECO2 pipeline with the AODC seed point ---
+    pred_boxes, count, exemplar_boxes = _run_inference(
+        image_np,
+        points=[[x, y]],
+        labels=[1],
+        threshold=threshold,
+    )
 
     return JSONResponse({
         "count": count,

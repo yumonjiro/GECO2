@@ -1,0 +1,73 @@
+# AODC service — density-map → seed point
+FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 \
+    python3.10-dev \
+    python3-pip \
+    git \
+    wget \
+    ninja-build \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxrender1 \
+    libxext6 \
+    ca-certificates \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --upgrade pip setuptools wheel
+
+WORKDIR /app
+
+# 1. PyTorch cu118
+RUN pip install torch==2.1.0 torchvision==0.16.0 \
+    --index-url https://download.pytorch.org/whl/cu118
+
+# 2. mmcv cu118 wheel
+RUN pip install mmcv==2.1.0 \
+    -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.1/index.html
+
+# 3. 依存パッケージ（動作確認済み版に合わせる）
+RUN pip install \
+    timm==0.4.12 \
+    yacs \
+    termcolor \
+    'numpy<2' \
+    matplotlib \
+    Pillow \
+    opencv-python-headless \
+    tqdm \
+    ftfy \
+    regex \
+    einops \
+    scipy \
+    fastapi \
+    "uvicorn[standard]" \
+    python-multipart \
+    httpx
+
+# 4. ResNet50 backbone を事前ダウンロード（ランタイムにインターネット不要）
+RUN python3 -c "import torchvision; torchvision.models.resnet50(weights='IMAGENET1K_V1')"
+
+# AODC repo (clone and rename models/ → aodc_models/ as required by aodc_wrapper.py)
+# Must be present at build time:
+#   git clone https://github.com/WJWu20/AODC.git AODC
+#   mv AODC/models AODC/aodc_models
+COPY AODC AODC
+
+# GECO2 pieces needed only for models/aodc_wrapper.py
+COPY models models
+COPY aodc_server.py ./
+
+# Checkpoint injected at runtime via bind-mount (see docker-compose.yml)
+# COPY aodc.pth .
+
+EXPOSE 7861
+CMD ["python3", "aodc_server.py"]

@@ -1,0 +1,78 @@
+services:
+
+  # ────────────────────────────────────────────────────────────
+  # AODC  — density-map → seed point  (port 7861)
+  # ────────────────────────────────────────────────────────────
+  aodc:
+    build:
+      context: .
+      dockerfile: Dockerfile.aodc
+    image: geco2-aodc:latest
+    container_name: aodc
+    restart: unless-stopped
+    environment:
+      - AODC_CHECKPOINT=/app/aodc.pth
+      - AODC_PORT=7861
+    volumes:
+      # Drop your checkpoint here; no rebuild needed
+      - ./aodc.pth:/app/aodc.pth:ro
+    ports:
+      - "7861:7861"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:7861/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - geco2_net
+
+  # ────────────────────────────────────────────────────────────
+  # SAM2 + GECO2  — point → mask → count  (port 7860)
+  # ────────────────────────────────────────────────────────────
+  geco2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: geco2:latest
+    container_name: geco2
+    restart: unless-stopped
+    environment:
+      # Tell geco2 where AODC lives (resolved via Docker network alias)
+      - AODC_SERVICE_URL=http://aodc:7861
+    volumes:
+      # Drop your checkpoint here; no rebuild needed
+      - ./CNTQG_multitrain_ca44.pth:/app/CNTQG_multitrain_ca44.pth:ro
+    ports:
+      - "7860:7860"
+    depends_on:
+      aodc:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:7860/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - geco2_net
+
+networks:
+  geco2_net:
+    driver: bridge

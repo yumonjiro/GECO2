@@ -91,7 +91,7 @@ class AODCWrapper:
 
         config = _AODCConfig()
         model, _ = _aodc_build_model(config)
-        state = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        state = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
         # Support checkpoints saved as {"model": state_dict} or raw state_dicts
         state_dict = state.get("model", state)
