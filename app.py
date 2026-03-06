@@ -40,7 +40,7 @@ def process_image_once(inputs, enable_mask):
     img = img.unsqueeze(0).to(device)
     bboxes = bboxes.unsqueeze(0).to(device)
 
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == 'cuda')):
         outputs, _, _, _, masks = model(img, bboxes)
 
     return image, outputs, masks, img, scale, drawn_boxes

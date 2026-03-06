@@ -100,9 +100,10 @@ def _run_inference(
     point_coords = torch.tensor(points, dtype=torch.float32, device=_device) * scale
     point_labels = torch.tensor(labels, dtype=torch.int32, device=_device)
 
-    # Single forward pass: backbone runs once, returns both exemplar info and detections
-    outputs, _, _, _, masks, exemplar_masks, exemplar_ious, exemplar_bboxes = \
-        _pipeline.forward_with_exemplars(img_tensor, point_coords, point_labels)
+    # Single forward pass with FP16 mixed precision
+    with torch.autocast(device_type=_device.type, dtype=torch.float16, enabled=(_device.type == 'cuda')):
+        outputs, _, _, _, masks, exemplar_masks, exemplar_ious, exemplar_bboxes = \
+            _pipeline.forward_with_exemplars(img_tensor, point_coords, point_labels)
 
     # Post-process
     pred_boxes = outputs[0]["pred_boxes"]
