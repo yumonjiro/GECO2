@@ -24,6 +24,8 @@ import torchvision.ops as ops
 
 from models.counter_infer import build_model
 from models.point_to_count import PointToCountPipeline
+from models.aodc_wrapper import AODCWrapper
+from models.aodc_to_count import AutoCountPipeline
 from utils.arg_parser import get_argparser
 from utils.data import resize_and_pad
 
@@ -34,6 +36,7 @@ logger = logging.getLogger(__name__)
 # Global state (populated on startup)
 # ---------------------------------------------------------------------------
 _pipeline: Optional[PointToCountPipeline] = None
+_auto_pipeline: Optional[AutoCountPipeline] = None
 _device: Optional[torch.device] = None
 
 
@@ -56,13 +59,34 @@ def _load_pipeline(
     return pipeline, device
 
 
+def _load_auto_pipeline(
+    ptc_pipeline: PointToCountPipeline,
+    device: torch.device,
+    aodc_checkpoint: str = "aodc.pth",
+) -> Optional[AutoCountPipeline]:
+    """Load AODC and wrap with AutoCountPipeline. Returns None if checkpoint missing."""
+    import os
+    if not os.path.exists(aodc_checkpoint):
+        logger.warning(
+            "AODC checkpoint '%s' not found — /predict_auto will be unavailable.",
+            aodc_checkpoint,
+        )
+        return None
+    logger.info("Loading AODC from %s …", aodc_checkpoint)
+    aodc = AODCWrapper(aodc_checkpoint, device)
+    return AutoCountPipeline(aodc, ptc_pipeline, device)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load model once at startup."""
-    global _pipeline, _device
+    global _pipeline, _auto_pipeline, _device
     logger.info("Loading GECO2 pipeline …")
     _pipeline, _device = _load_pipeline()
     logger.info("Pipeline ready on %s", _device)
+    _auto_pipeline = _load_auto_pipeline(_pipeline, _device)
+    if _auto_pipeline is not None:
+        logger.info("AutoCountPipeline (AODC→SAM2→GECO2) ready.")
     yield
     logger.info("Shutting down.")
 
@@ -202,6 +226,51 @@ async def predict(
     pred_boxes, count, exemplar_boxes = _run_inference(
         image_np, points_list, labels_list, threshold=threshold,
     )
+
+    return JSONResponse({
+        "count": count,
+        "pred_boxes": pred_boxes,
+        "exemplar_boxes": exemplar_boxes,
+    })
+
+
+@app.post("/predict_auto")
+async def predict_auto(
+    image: UploadFile = File(..., description="Input image (JPEG/PNG)"),
+    threshold: float = Form(default=0.33, description="Detection confidence threshold (0.05–0.95)"),
+):
+    """Run fully automatic counting — no point prompts needed.
+
+    AODC generates a density map from the image alone and extracts the top-1
+    peak as the seed point, which is then passed to the SAM2→GECO2 pipeline.
+
+    **Request** (multipart/form-data):
+    - `image`: image file
+    - `threshold` *(optional)*: float, default 0.33
+
+    **Response**:
+    ```json
+    {
+      "count": 42,
+      "pred_boxes": [[x1,y1,x2,y2], ...],
+      "exemplar_boxes": [[x1,y1,x2,y2], ...]
+    }
+    ```
+    """
+    if _auto_pipeline is None:
+        raise HTTPException(
+            status_code=503,
+            detail="AutoCountPipeline not available: AODC checkpoint not found at startup.",
+        )
+
+    try:
+        contents = await image.read()
+        pil = Image.open(io.BytesIO(contents)).convert("RGB")
+        image_np = np.array(pil)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
+
+    pred_boxes, count, exemplar_boxes = _auto_pipeline.run(image_np, threshold=threshold)
 
     return JSONResponse({
         "count": count,
