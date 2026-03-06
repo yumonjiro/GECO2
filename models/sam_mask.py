@@ -101,6 +101,42 @@ class MaskProcessor(nn.Module):
                 ][::-1]
         return feats
 
+    @staticmethod
+    def _masks_to_bboxes(masks: torch.Tensor) -> torch.Tensor:
+        """Extract bounding boxes from binary masks using vectorized operations.
+
+        Args:
+            masks: Binary masks [B, H, W].
+
+        Returns:
+            bboxes: [B, 4] as (x1, y1, x2, y2). Zero for empty masks.
+        """
+        B, H, W = masks.shape
+        bboxes = torch.zeros((B, 4), dtype=torch.float, device=masks.device)
+        if B == 0:
+            return bboxes
+
+        # any() along H → cols [B, W], any() along W → rows [B, H]
+        has_col = masks.any(dim=1)  # [B, W]
+        has_row = masks.any(dim=2)  # [B, H]
+
+        # For each mask, find first/last True along each axis
+        # Use argmax on bool tensor (returns first True); flip for last True
+        non_empty = has_col.any(dim=1)  # [B]
+        if non_empty.sum() == 0:
+            return bboxes
+
+        # x1: first column with any pixel
+        bboxes[non_empty, 0] = has_col[non_empty].to(torch.uint8).argmax(dim=1).float()
+        # x2: last column with any pixel
+        bboxes[non_empty, 2] = (W - 1) - has_col[non_empty].flip(dims=[1]).to(torch.uint8).argmax(dim=1).float()
+        # y1: first row with any pixel
+        bboxes[non_empty, 1] = has_row[non_empty].to(torch.uint8).argmax(dim=1).float()
+        # y2: last row with any pixel
+        bboxes[non_empty, 3] = (H - 1) - has_row[non_empty].flip(dims=[1]).to(torch.uint8).argmax(dim=1).float()
+
+        return bboxes
+
     def predict_masks_from_points(
         self,
         backbone_feats: dict,
@@ -169,13 +205,8 @@ class MaskProcessor(nn.Module):
             )
             masks = masks[:, mask_select_index] > 0  # [B, H, W]
 
-            # Extract bounding boxes from masks
-            bboxes = torch.zeros((masks.shape[0], 4), dtype=torch.float, device=masks.device)
-            for i, mask in enumerate(masks):
-                y, x = torch.where(mask)
-                if y.shape[0] > 0:
-                    bboxes[i] = torch.tensor([x.min(), y.min(), x.max(), y.max()],
-                                             dtype=torch.float, device=masks.device)
+            # Extract bounding boxes from masks (vectorized)
+            bboxes = self._masks_to_bboxes(masks)
 
             all_masks.append(masks)
             all_ious.append(selected_ious)
@@ -235,16 +266,11 @@ class MaskProcessor(nn.Module):
                 mode = "bilinear",
                 align_corners = False)
                 masks = masks > 0
-
-                corrected_bboxes = torch.zeros((masks.shape[0], 4), dtype=torch.float)
                 masks = masks[:, 2]
-                for index, mask in enumerate(masks):
-                    y, x = torch.where(mask != 0)
-                    if y.shape[0] > 0 and x.shape[0] > 0:
-                        corrected_bboxes[index, 0] = torch.min(x)
-                        corrected_bboxes[index, 1] = torch.min(y)
-                        corrected_bboxes[index, 2] = torch.max(x)
-                        corrected_bboxes[index, 3] = torch.max(y)
+
+                # Extract bounding boxes from masks (vectorized)
+                corrected_bboxes = self._masks_to_bboxes(masks)
+
                 masks_.append(masks)
                 corrected_bboxes_.append(corrected_bboxes)
             if only_score:

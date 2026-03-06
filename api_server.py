@@ -100,13 +100,9 @@ def _run_inference(
     point_coords = torch.tensor(points, dtype=torch.float32, device=_device) * scale
     point_labels = torch.tensor(labels, dtype=torch.int32, device=_device)
 
-    # SAM2 exemplar masks (for auxiliary info)
-    exemplar_masks, exemplar_ious, exemplar_bboxes = _pipeline.predict_exemplar_masks(
-        img_tensor, point_coords, point_labels,
-    )
-
-    # Full pipeline
-    outputs, _, _, _, masks = _pipeline(img_tensor, point_coords, point_labels)
+    # Single forward pass: backbone runs once, returns both exemplar info and detections
+    outputs, _, _, _, masks, exemplar_masks, exemplar_ious, exemplar_bboxes = \
+        _pipeline.forward_with_exemplars(img_tensor, point_coords, point_labels)
 
     # Post-process
     pred_boxes = outputs[0]["pred_boxes"]

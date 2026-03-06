@@ -92,3 +92,44 @@ class PointToCountPipeline(nn.Module):
             point_coords=point_coords,
             point_labels=point_labels,
         )
+
+    @torch.no_grad()
+    def forward_with_exemplars(
+        self,
+        image: torch.Tensor,
+        point_coords: torch.Tensor,
+        point_labels: torch.Tensor,
+    ) -> Tuple[list, torch.Tensor, torch.Tensor, torch.Tensor, object,
+               torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run backbone once, return both exemplar info and detection results.
+
+        Returns:
+            outputs, ref_points, centerness, outputs_coord, masks,
+            exemplar_masks, exemplar_ious, exemplar_bboxes
+        """
+        # Backbone runs only once
+        feats = self.cnt.forward_backbone(image)
+
+        # SAM2 point-prompt → masks → exemplar bounding boxes
+        exemplar_masks, exemplar_ious, exemplar_bboxes = \
+            self.cnt.sam_mask.predict_masks_from_points(
+                backbone_feats=feats,
+                point_coords=point_coords,
+                point_labels=point_labels,
+            )
+
+        # Filter low-quality masks
+        keep = exemplar_ious >= self.iou_threshold
+        if keep.sum() == 0:
+            keep = exemplar_ious >= exemplar_ious.max() * 0.5
+        bboxes_px = exemplar_bboxes[keep]
+
+        # Normalize bboxes to [0, 1] for GECO2
+        image_size = float(image.shape[-1])
+        bboxes_norm = bboxes_px / image_size
+        bboxes_norm = bboxes_norm.unsqueeze(0).to(image.device)
+
+        # Detection with shared features (no second backbone call)
+        det_results = self.cnt.forward_detect(feats, bboxes_norm, image_size=image_size)
+
+        return (*det_results, exemplar_masks, exemplar_ious, exemplar_bboxes)
