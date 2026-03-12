@@ -115,6 +115,59 @@ def _decode_aodc_areas(
     )
 
 
+def _filter_merged_exemplars(
+    bboxes: List[List[float]],
+    points: List[List[float]],
+) -> List[List[float]]:
+    """Remove exemplar BBs that contain multiple AODC seed points (merged objects).
+
+    If a single SAM2 mask engulfs 2+ AODC peaks, the BB covers multiple objects
+    and would mislead GECO2. Discard such BBs — the remaining single-object
+    exemplars are sufficient.
+    """
+    if len(bboxes) <= 1 or len(points) <= 1:
+        return bboxes
+
+    keep = []
+    for bb in bboxes:
+        x1, y1, x2, y2 = bb
+        count_inside = sum(1 for px, py in points if x1 <= px <= x2 and y1 <= py <= y2)
+        if count_inside <= 1:
+            keep.append(bb)
+
+    return keep if keep else bboxes  # fallback: keep all if everything is merged
+
+
+def _filter_exemplars_by_shape(
+    bboxes: List[List[float]],
+    max_aspect_dev: float = 2.0,
+) -> List[List[float]]:
+    """Remove exemplar BBs whose aspect ratio deviates from the median.
+
+    Catches noise BBs (e.g. elongated text regions among round pills)
+    by comparing each BB's aspect ratio to the group median.
+    """
+    if len(bboxes) <= 2:
+        return bboxes
+
+    aspects = []
+    for b in bboxes:
+        w = max(b[2] - b[0], 1e-6)
+        h = max(b[3] - b[1], 1e-6)
+        aspects.append(max(w, h) / min(w, h))  # always >= 1
+
+    sorted_ar = sorted(aspects)
+    median_ar = sorted_ar[len(sorted_ar) // 2]
+
+    keep = []
+    for i, ar in enumerate(aspects):
+        ratio = max(ar, median_ar) / min(ar, median_ar)
+        if ratio <= max_aspect_dev:
+            keep.append(bboxes[i])
+
+    return keep if keep else bboxes  # fallback: keep all if everything is outlier
+
+
 def _filter_exemplars_by_area(
     bboxes: List[List[float]],
     area_ratio: float = 3.0,
@@ -155,6 +208,44 @@ def _filter_exemplars_by_area(
     # Keep the larger-area group (everything from split_pos onward)
     keep = indices[split_pos:]
     return [bboxes[i] for i in keep]
+
+
+def _filter_aodc_points_by_area(
+    points: List[List[float]],
+    expected_areas: List[float],
+    area_ratio: float = 3.0,
+) -> Tuple[List[List[float]], List[float]]:
+    """Pre-filter AODC seed points by estimated area before SAM2.
+
+    Uses the same biggest-gap logic as _filter_exemplars_by_area but operates
+    on AODC density-map area estimates (not SAM2 BB areas).  This catches
+    small-hole peaks that would otherwise all pass through SAM2 as valid
+    exemplars of similar size.
+
+    Returns filtered (points, expected_areas) keeping the larger-area group.
+    """
+    if len(points) <= 1 or not expected_areas:
+        return points, expected_areas
+
+    indices = sorted(range(len(expected_areas)), key=lambda i: expected_areas[i])
+
+    max_gap_ratio = 0.0
+    split_pos = -1
+    for i in range(1, len(indices)):
+        smaller = max(expected_areas[indices[i - 1]], 1e-6)
+        ratio = expected_areas[indices[i]] / smaller
+        if ratio > max_gap_ratio:
+            max_gap_ratio = ratio
+            split_pos = i
+
+    if max_gap_ratio <= area_ratio:
+        return points, expected_areas
+
+    keep = indices[split_pos:]
+    return (
+        [points[i] for i in keep],
+        [expected_areas[i] for i in keep],
+    )
 
 
 def _preprocess_image(image: np.ndarray) -> Tuple[torch.Tensor, float]:
@@ -241,8 +332,21 @@ def _run_inference(
     # Remove outlier exemplars (e.g. "hole" vs "whole object" with very different sizes)
     exemplar_bboxes_orig = _filter_exemplars_by_area(exemplar_bboxes_orig)
 
+    # Remove BBs that engulf multiple AODC seed points (merged objects)
+    exemplar_bboxes_orig = _filter_merged_exemplars(exemplar_bboxes_orig, points)
+
+    # Remove BBs with anomalous aspect ratios (e.g. text regions among round objects)
+    exemplar_bboxes_orig = _filter_exemplars_by_shape(exemplar_bboxes_orig)
+
     if not exemplar_bboxes_orig:
         return [], 0, []
+
+    # Select the single best exemplar (median area) for GECO2
+    if len(exemplar_bboxes_orig) > 1:
+        areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in exemplar_bboxes_orig]
+        order = sorted(range(len(areas)), key=lambda i: areas[i])
+        median_idx = order[len(order) // 2]
+        exemplar_bboxes_orig = [exemplar_bboxes_orig[median_idx]]
 
     # --- Pass 2: adaptive re-preprocessing + detection ---
     img_tensor, bboxes_scaled, scale = _preprocess_image_with_bboxes(image, exemplar_bboxes_orig)
@@ -547,6 +651,13 @@ async def predict_auto(
     # Decode density map and estimate per-object areas
     expected_areas = _decode_aodc_areas(aodc_result, image_np.shape[0], image_np.shape[1])
 
+    # Pre-filter: remove small-hole peaks before SAM2
+    if expected_areas is not None:
+        points, expected_areas = _filter_aodc_points_by_area(points, expected_areas)
+
+    if not points:
+        return JSONResponse({"count": 0, "pred_boxes": [], "exemplar_boxes": []})
+
     # --- Run local SAM2+GECO2 pipeline with the AODC seed points ---
     pred_boxes, count, exemplar_boxes = _run_inference(
         image_np,
@@ -606,6 +717,13 @@ async def predict_auto_image(
 
     # Decode density map and estimate per-object areas
     expected_areas = _decode_aodc_areas(aodc_result, image_np.shape[0], image_np.shape[1])
+
+    # Pre-filter: remove small-hole peaks before SAM2
+    if expected_areas is not None:
+        points, expected_areas = _filter_aodc_points_by_area(points, expected_areas)
+
+    if not points:
+        return _image_response(_draw_boxes(pil, [], [], 0))
 
     pred_boxes, count, exemplar_boxes = _run_inference(
         image_np, points=points, labels=[1] * len(points), threshold=threshold,

@@ -212,12 +212,21 @@ class MaskProcessor(nn.Module):
                 batch_expected = expected_areas[start:start + step]  # [B]
 
             if batch_expected is not None and multimask_output:
-                # Compute area of each of the 3 masks
+                # Default to index 2 (whole object). Only fall back to
+                # area-based selection when mask 2 is suspiciously large
+                # (likely merging adjacent objects).
                 mask_areas = (masks_full > 0).flatten(2).sum(dim=2).float()  # [B, 3]
-                # Select index with area closest to expected
-                diff = (mask_areas - batch_expected.unsqueeze(1)).abs()  # [B, 3]
-                best_idx = diff.argmin(dim=1)  # [B]
                 B = masks_full.shape[0]
+                best_idx = torch.full((B,), 2, dtype=torch.long, device=masks_full.device)
+
+                merge_ratio = 10.0  # mask2 > expected * 10 → likely merge
+                largest_area = mask_areas[:, 2]
+                is_merged = largest_area > (batch_expected * merge_ratio)
+                if is_merged.any():
+                    diff = (mask_areas - batch_expected.unsqueeze(1)).abs()
+                    area_best_idx = diff.argmin(dim=1)
+                    best_idx[is_merged] = area_best_idx[is_merged]
+
                 arange = torch.arange(B, device=masks_full.device)
                 selected_ious = iou_predictions[arange, best_idx]
                 masks = masks_full[arange, best_idx] > 0  # [B, H, W]
