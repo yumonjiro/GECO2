@@ -47,13 +47,22 @@ def load_pipeline(checkpoint_path: str = "CNTQG_multitrain_ca44.pth", iou_thresh
 
 
 def preprocess_image(image: np.ndarray, device: torch.device):
-    """Normalize and pad an HWC uint8 image to [1, 3, 1024, 1024]."""
+    """Normalize and pad an HWC uint8 image to [1, 3, 1024, 1024] (zero-shot, no exemplar bboxes)."""
     tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
     tensor = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(tensor)
     # resize_and_pad needs dummy bboxes; just pass a single dummy box
     dummy_bbox = torch.tensor([[0, 0, 1, 1]], dtype=torch.float32)
     padded_img, _, scale = resize_and_pad(tensor, dummy_bbox, size=1024.0, zero_shot=True)
     return padded_img.unsqueeze(0).to(device), scale
+
+
+def preprocess_image_with_bboxes(image: np.ndarray, bboxes: list, device: torch.device):
+    """Normalize, resize-and-pad with adaptive scaling (~80px objects)."""
+    tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+    tensor = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(tensor)
+    bboxes_tensor = torch.tensor(bboxes, dtype=torch.float32)
+    padded, bboxes_scaled, scale = resize_and_pad(tensor, bboxes_tensor, size=1024.0)
+    return padded.unsqueeze(0).to(device), bboxes_scaled.unsqueeze(0).to(device), scale
 
 
 def run_point_counting(
@@ -64,7 +73,10 @@ def run_point_counting(
     device: torch.device,
     threshold: float = 0.33,
 ):
-    """Run the full point-to-count pipeline on a single image.
+    """Run the full point-to-count pipeline on a single image (two-pass with adaptive scaling).
+
+    Pass 1: zero-shot preprocessing → backbone → SAM2 point→mask→bbox (get exemplars).
+    Pass 2: re-preprocess with adaptive scaling using those bboxes → backbone → detection.
 
     Args:
         pipeline: Loaded PointToCountPipeline.
@@ -78,28 +90,43 @@ def run_point_counting(
         pred_boxes: List of [x1, y1, x2, y2] in original image coordinates.
         count: Number of detected objects.
         exemplar_masks: Binary masks [N, H, W] of SAM2-generated exemplar regions.
-        exemplar_bboxes: [N, 4] exemplar bounding boxes in pixel coordinates.
+        exemplar_bboxes: [N, 4] exemplar bounding boxes in original image pixel coordinates.
     """
-    img_tensor, scale = preprocess_image(image, device)
-
-    # Scale point coordinates to the padded 1024x1024 space
-    point_coords = torch.tensor(points, dtype=torch.float32, device=device) * scale
+    # --- Pass 1: SAM2 exemplar extraction at zero-shot scale ---
+    img_tensor_zs, scale_zs = preprocess_image(image, device)
+    point_coords = torch.tensor(points, dtype=torch.float32, device=device) * scale_zs
     point_labels = torch.tensor(labels, dtype=torch.int32, device=device)
 
-    # Get exemplar masks for visualization
-    exemplar_masks, exemplar_ious, exemplar_bboxes = pipeline.predict_exemplar_masks(
-        img_tensor, point_coords, point_labels,
-    )
+    feats_zs = pipeline.cnt.forward_backbone(img_tensor_zs)
+    exemplar_masks, exemplar_ious, exemplar_bboxes = \
+        pipeline.cnt.sam_mask.predict_masks_from_points(
+            backbone_feats=feats_zs,
+            point_coords=point_coords,
+            point_labels=point_labels,
+        )
 
-    # Run full pipeline: points → masks → BBs → GECO2 counting
-    outputs, ref_points, centerness, outputs_coord, masks = pipeline(
-        img_tensor, point_coords, point_labels,
-    )
+    # Filter low-quality masks
+    keep_mask = exemplar_ious >= pipeline.iou_threshold
+    if keep_mask.sum() == 0:
+        keep_mask = exemplar_ious >= exemplar_ious.max() * 0.5
+    bboxes_px = exemplar_bboxes[keep_mask]
 
-    # Post-process detections
-    idx = 0
-    pred_boxes = outputs[idx]["pred_boxes"]
-    box_v = outputs[idx]["box_v"]
+    if bboxes_px.numel() == 0:
+        return [], 0, exemplar_masks.cpu(), exemplar_bboxes.cpu()
+
+    # Convert SAM bboxes back to original image coordinates
+    bboxes_orig = (bboxes_px / scale_zs).cpu().tolist()
+
+    # --- Pass 2: adaptive re-preprocessing + detection ---
+    img_tensor, bboxes_scaled, scale = preprocess_image_with_bboxes(image, bboxes_orig, device)
+    image_size = float(img_tensor.shape[-1])
+
+    feats = pipeline.cnt.forward_backbone(img_tensor)
+    det_results = pipeline.cnt.forward_detect(feats, bboxes_scaled, image_size=image_size)
+
+    outputs = det_results[0]
+    pred_boxes = outputs[0]["pred_boxes"]
+    box_v = outputs[0]["box_v"]
 
     if pred_boxes.dim() == 3:
         pred_boxes = pred_boxes[0]
@@ -110,22 +137,20 @@ def run_point_counting(
     sel = box_v > (box_v.max() / thr_inv) if box_v.numel() > 0 else torch.zeros(0, dtype=torch.bool)
 
     if sel.sum() == 0:
-        return [], 0, exemplar_masks.cpu(), exemplar_bboxes.cpu()
+        return [], 0, exemplar_masks.cpu(), torch.tensor(bboxes_orig)
 
     keep = ops.nms(pred_boxes[sel], box_v[sel], 0.5)
     pred_boxes = pred_boxes[sel][keep]
     pred_boxes = torch.clamp(pred_boxes, 0, 1)
-    pred_boxes = (pred_boxes / scale * img_tensor.shape[-1]).cpu().tolist()
+    pred_boxes = (pred_boxes / scale * image_size).cpu().tolist()
 
-    return pred_boxes, len(pred_boxes), exemplar_masks.cpu(), exemplar_bboxes.cpu()
+    return pred_boxes, len(pred_boxes), exemplar_masks.cpu(), torch.tensor(bboxes_orig)
 
 
 def visualize_result(
     image: np.ndarray,
     pred_boxes: list,
     exemplar_bboxes: torch.Tensor,
-    scale: float,
-    image_size: int = 1024,
 ) -> Image.Image:
     """Draw detection and exemplar boxes on the image."""
     pil_img = Image.fromarray(image)
@@ -135,10 +160,9 @@ def visualize_result(
     for box in pred_boxes:
         draw.rectangle(box, outline="orange", width=2)
 
-    # Draw exemplar boxes (green, derived from point prompts)
+    # Draw exemplar boxes (green, already in original image coordinates)
     for bbox in exemplar_bboxes:
-        bbox_orig = (bbox / scale).tolist()
-        draw.rectangle(bbox_orig, outline="lime", width=3)
+        draw.rectangle(bbox.tolist(), outline="lime", width=3)
 
     # Counter badge
     w, h = pil_img.size
@@ -196,8 +220,7 @@ def build_gradio_app(pipeline, device):
             pipeline, image_np, points, labels, device, threshold=threshold,
         )
 
-        _, scale = preprocess_image(image_np, device)
-        result = visualize_result(image_np, pred_boxes, exemplar_bboxes, scale)
+        result = visualize_result(image_np, pred_boxes, exemplar_bboxes)
         return result, count
 
     def clear_points():
@@ -293,8 +316,7 @@ def main():
             print(f"  Box {i}: [{box[0]:.1f}, {box[1]:.1f}, {box[2]:.1f}, {box[3]:.1f}]")
 
         if args.output:
-            _, scale = preprocess_image(image, device)
-            result = visualize_result(image, pred_boxes, exemplar_bboxes, scale)
+            result = visualize_result(image, pred_boxes, exemplar_bboxes)
             result.save(args.output)
             print(f"Saved to {args.output}")
 

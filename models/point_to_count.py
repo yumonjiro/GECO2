@@ -64,13 +64,14 @@ class PointToCountPipeline(nn.Module):
         bboxes_px = bboxes_px[keep]
         masks = masks[keep]
 
-        # Step 4: Normalize bboxes to [0, 1] range for GECO2
+        # Step 4: Keep bboxes in pixel space for GECO2
+        #   roi_align and shape_or_objectness expect pixel coordinates (0–1024 range),
+        #   NOT [0,1]-normalized values.
         image_size = float(image.shape[-1])
-        bboxes_norm = bboxes_px / image_size  # [M, 4]
-        bboxes_norm = bboxes_norm.unsqueeze(0).to(image.device)  # [1, M, 4]
+        bboxes_for_detect = bboxes_px.unsqueeze(0).to(image.device)  # [1, M, 4]
 
         # Step 5: Run GECO2 detection with shared features
-        return self.cnt.forward_detect(feats, bboxes_norm, image_size=image_size)
+        return self.cnt.forward_detect(feats, bboxes_for_detect, image_size=image_size)
 
     @torch.no_grad()
     def predict_exemplar_masks(
@@ -124,12 +125,11 @@ class PointToCountPipeline(nn.Module):
             keep = exemplar_ious >= exemplar_ious.max() * 0.5
         bboxes_px = exemplar_bboxes[keep]
 
-        # Normalize bboxes to [0, 1] for GECO2
+        # Keep bboxes in pixel space (0–1024 range) for forward_detect
         image_size = float(image.shape[-1])
-        bboxes_norm = bboxes_px / image_size
-        bboxes_norm = bboxes_norm.unsqueeze(0).to(image.device)
+        bboxes_for_detect = bboxes_px.unsqueeze(0).to(image.device)
 
         # Detection with shared features (no second backbone call)
-        det_results = self.cnt.forward_detect(feats, bboxes_norm, image_size=image_size)
+        det_results = self.cnt.forward_detect(feats, bboxes_for_detect, image_size=image_size)
 
         return (*det_results, exemplar_masks, exemplar_ious, exemplar_bboxes)
