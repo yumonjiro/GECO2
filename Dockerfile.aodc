@@ -1,5 +1,8 @@
-# AODC service — density-map → seed point
-FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
+# ---------------------------------------------------------
+# 【変更点1】ベースイメージを CUDA 12.8 に変更
+# （最近のNVIDIAイメージはcudnnをタグに含めないのが標準です）
+# ---------------------------------------------------------
+FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -26,15 +29,20 @@ RUN python -m pip install --upgrade pip setuptools wheel
 
 WORKDIR /app
 
-# 1. PyTorch cu118
-RUN pip install torch==2.1.0 torchvision==0.16.0 \
-    --index-url https://download.pytorch.org/whl/cu118
+# ---------------------------------------------------------
+# 【変更点2】PyTorch 2.7.0 + cu128（これで sm_120 にネイティブ対応します）
+# ※torchvision等は自動で互換性のあるバージョンが入るようバージョン指定を外します
+# ---------------------------------------------------------
+RUN pip install torch==2.7.0 torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu128
 
-# 2. mmcv cu118 wheel
-RUN pip install mmcv==2.1.0 \
-    -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.1/index.html
+# ---------------------------------------------------------
+# 【変更点3】mmcv を pt2.7.0cu128 用に指定
+# ---------------------------------------------------------
+RUN pip install mmcv==2.2.0+pt2.7.0cu128 \
+    --extra-index-url https://miropsota.github.io/torch_packages_builder
 
-# 3. 依存パッケージ（動作確認済み版に合わせる）
+# 3. 依存パッケージ（ここは変更なし）
 RUN pip install \
     timm==0.4.12 \
     yacs \
@@ -53,21 +61,12 @@ RUN pip install \
     python-multipart \
     httpx
 
-# 4. ResNet50 backbone を事前ダウンロード（ランタイムにインターネット不要）
+# 4. ResNet50 backbone を事前ダウンロード
 RUN python3 -c "import torchvision; torchvision.models.resnet50(weights='IMAGENET1K_V1')"
 
-# AODC repo (clone and rename models/ → aodc_models/ as required by aodc_wrapper.py)
-# Must be present at build time:
-#   git clone https://github.com/WJWu20/AODC.git AODC
-#   mv AODC/models AODC/aodc_models
 COPY AODC AODC
-
-# GECO2 pieces needed only for models/aodc_wrapper.py
 COPY models models
 COPY aodc_server.py ./
-
-# Checkpoint injected at runtime via bind-mount (see docker-compose.yml)
-# COPY aodc.pth .
 
 EXPOSE 7861
 CMD ["python3", "aodc_server.py"]

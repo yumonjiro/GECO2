@@ -1,12 +1,12 @@
 ## Build time
 # Use the specified Python runtime as a parent image
-FROM docker.io/nvidia/cuda:12.1.0-devel-ubuntu22.04@sha256:e3a8f7b933e77ecee74731198a2a5483e965b585cea2660675cf4bb152237e9b AS build
+FROM nvidia/cuda:12.8.0-devel-ubuntu22.04 AS build
 
 # Set the working directory in the container
 WORKDIR /usr/src/app
 
 ENV CUDA_HOME=/usr/local/cuda \
-    TORCH_CUDA_ARCH_LIST="6.0 6.1 7.0 7.5 8.0 8.6+PTX" \
+    TORCH_CUDA_ARCH_LIST="6.0 6.1 7.0 7.5 8.0 8.6 12.0+PTX" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
@@ -62,6 +62,8 @@ ENV PATH="/opt/venv/bin:$PATH"
 COPY req.txt .
 COPY gradio_image_prompter-0.1.0-py3-none-any.whl .
 RUN --mount=type=cache,id=pip,target=/root/.cache \
+    pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+RUN --mount=type=cache,id=pip,target=/root/.cache \
     pip install -r req.txt
 
 
@@ -77,7 +79,7 @@ RUN CC=/usr/bin/gcc-11 python3 setup.py build && \
 FROM ubuntu:22.04
 
 ENV CUDA_HOME=/usr/local/cuda \
-    TORCH_CUDA_ARCH_LIST="6.0 6.1 7.0 7.5 8.0 8.6+PTX" \
+    TORCH_CUDA_ARCH_LIST="6.0 6.1 7.0 7.5 8.0 8.6 12.0+PTX" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:/home/user/.local/bin:$PATH" \
