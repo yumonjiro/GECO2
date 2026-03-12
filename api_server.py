@@ -589,6 +589,41 @@ def _generate_detection_masks(
     return clipped_masks
 
 
+_INSTANCE_PALETTE: List[Tuple[int, int, int]] = [
+    (255, 191, 71),   # amber
+    (135, 206, 250),  # sky
+    (153, 230, 179),  # mint
+    (255, 179, 186),  # coral pink
+    (176, 224, 230),  # powder cyan
+    (255, 214, 165),  # apricot
+    (199, 243, 205),  # soft lime
+    (255, 205, 210),  # blush
+    (173, 216, 230),  # airy blue
+    (255, 228, 181),  # moccasin
+]
+
+
+def _reading_order_indices(boxes: List[List[float]]) -> List[int]:
+    """Return indices sorted in reading order: top-to-bottom, left-to-right."""
+    if not boxes:
+        return []
+    if len(boxes) == 1:
+        return [0]
+
+    heights = [max(1.0, b[3] - b[1]) for b in boxes]
+    median_h = float(np.median(np.asarray(heights, dtype=np.float32)))
+    row_band = max(20.0, 0.6 * median_h)
+
+    def sort_key(i: int) -> Tuple[int, float, float]:
+        x1, y1, x2, y2 = boxes[i]
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        row = int(cy // row_band)
+        return row, cx, cy
+
+    return sorted(range(len(boxes)), key=sort_key)
+
+
 def _draw_boxes(
     pil_image: Image.Image,
     pred_boxes: List[List[float]],
@@ -604,34 +639,73 @@ def _draw_boxes(
     Count is rendered in the top-left corner.
     """
     img = pil_image.copy().convert("RGBA")
+    ordered_indices = _reading_order_indices(pred_boxes)
 
     # Draw semi-transparent mask overlay
     if masks is not None and len(masks) > 0:
-        combined = np.any(masks, axis=0)  # [H, W]
-        if combined.any():
-            # Build an alpha mask directly to avoid large RGBA numpy round-trips.
-            alpha = Image.fromarray((combined.astype(np.uint8) * 80), mode="L")
-            overlay = Image.new("RGBA", img.size, (60, 220, 60, 0))
-            overlay.putalpha(alpha)
+        overlay_np = np.zeros((img.size[1], img.size[0], 4), dtype=np.uint8)
+        # Color masks in reading order, so colors/numbers align with displayed order.
+        for rank, src_idx in enumerate(ordered_indices):
+            if src_idx >= len(masks):
+                continue
+            mask = masks[src_idx]
+            color = _INSTANCE_PALETTE[rank % len(_INSTANCE_PALETTE)]
+            overlay_np[mask, 0] = color[0]
+            overlay_np[mask, 1] = color[1]
+            overlay_np[mask, 2] = color[2]
+            overlay_np[mask, 3] = 130
+        if np.any(overlay_np[..., 3]):
+            overlay = Image.fromarray(overlay_np, mode="RGBA")
             img = Image.alpha_composite(img, overlay)
 
     img = img.convert("RGB")
     draw = ImageDraw.Draw(img)
+    font = None
+    index_font = None
+    for font_path in (
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ):
+        try:
+            font = ImageFont.truetype(font_path, size=24)
+            index_font = ImageFont.truetype(font_path, size=36)
+            break
+        except OSError:
+            continue
+    if font is None or index_font is None:
+        font = ImageFont.load_default()
+        index_font = font
 
-    for box in exemplar_boxes:
+    for i, box in enumerate(exemplar_boxes):
         x1, y1, x2, y2 = box
-        draw.rectangle([x1, y1, x2, y2], outline=(255, 60, 60), width=2)
+        # Exemplar BBs: lighter neutral style for distinction.
+        draw.rectangle([x1, y1, x2, y2], outline=(160, 160, 160), width=3)
+        tag = f"Ref{i + 1}"
+        tx = max(0, int(x1))
+        ty = max(0, int(y1) - 18)
+        tbox = draw.textbbox((tx, ty), tag, font=font)
+        draw.rectangle([tbox[0] - 3, tbox[1] - 2, tbox[2] + 3, tbox[3] + 2], fill=(235, 235, 235))
+        draw.text((tx, ty), tag, fill=(70, 70, 70), font=font)
 
-    for box in pred_boxes:
+    for rank, src_idx in enumerate(ordered_indices):
+        box = pred_boxes[src_idx]
         x1, y1, x2, y2 = box
-        draw.rectangle([x1, y1, x2, y2], outline=(60, 220, 60), width=2)
+        color = _INSTANCE_PALETTE[rank % len(_INSTANCE_PALETTE)]
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=6)
+        # Detection index label: 1, 2, 3, ...
+        tag = str(rank + 1)
+        cx = int(round((x1 + x2) / 2.0))
+        cy = int(round((y1 + y2) / 2.0))
+        tbox = draw.textbbox((0, 0), tag, font=index_font)
+        tw = tbox[2] - tbox[0]
+        th = tbox[3] - tbox[1]
+        tx = max(0, min(img.width - tw, cx - tw // 2))
+        ty = max(0, min(img.height - th, cy - th // 2))
+        draw.text((tx, ty), tag, fill=(0, 0, 0), font=index_font)
 
     # Count label
     label = f"Count: {count}"
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size=24)
-    except OSError:
-        font = ImageFont.load_default()
     margin = 6
     bbox = draw.textbbox((margin, margin), label, font=font)
     draw.rectangle([bbox[0] - margin, bbox[1] - margin, bbox[2] + margin, bbox[3] + margin],
@@ -770,7 +844,7 @@ async def predict_image(
         description='JSON array of labels (1=foreground, 0=background). Defaults to all foreground.',
     ),
     threshold: float = Form(default=0.33, description="Detection confidence threshold (0.05–0.95)"),
-    with_masks: bool = Form(default=False, description="If true, overlays SAM2 masks on output image."),
+    with_masks: bool = Form(default=True, description="If true, overlays SAM2 masks on output image."),
     response_format: str = Form(default=DEFAULT_IMAGE_FORMAT, description="Response format: png|jpeg|webp."),
     max_side: int = Form(default=DEFAULT_IMAGE_MAX_SIDE, description="Resize output image so longest side <= max_side. 0 disables."),
     quality: int = Form(default=DEFAULT_IMAGE_QUALITY, description="JPEG/WEBP quality (1-100)."),
@@ -879,7 +953,7 @@ async def predict_auto(
 async def predict_auto_image(
     image: UploadFile = File(..., description="Input image (JPEG/PNG)"),
     threshold: float = Form(default=0.33, description="Detection confidence threshold (0.05–0.95)"),
-    with_masks: bool = Form(default=False, description="If true, overlays SAM2 masks on output image."),
+    with_masks: bool = Form(default=True, description="If true, overlays SAM2 masks on output image."),
     response_format: str = Form(default=DEFAULT_IMAGE_FORMAT, description="Response format: png|jpeg|webp."),
     max_side: int = Form(default=DEFAULT_IMAGE_MAX_SIDE, description="Resize output image so longest side <= max_side. 0 disables."),
     quality: int = Form(default=DEFAULT_IMAGE_QUALITY, description="JPEG/WEBP quality (1-100)."),
@@ -969,7 +1043,7 @@ async def predict_bbox_image(
     image: UploadFile = File(..., description="Input image (JPEG/PNG)"),
     bboxes: str = Form(..., description='JSON array of exemplar bboxes [[x1,y1,x2,y2], ...] in original image pixel coordinates'),
     threshold: float = Form(default=0.33, description="Detection confidence threshold (0.05–0.95)"),
-    with_masks: bool = Form(default=False, description="If true, overlays SAM2 masks on output image."),
+    with_masks: bool = Form(default=True, description="If true, overlays SAM2 masks on output image."),
     response_format: str = Form(default=DEFAULT_IMAGE_FORMAT, description="Response format: png|jpeg|webp."),
     max_side: int = Form(default=DEFAULT_IMAGE_MAX_SIDE, description="Resize output image so longest side <= max_side. 0 disables."),
     quality: int = Form(default=DEFAULT_IMAGE_QUALITY, description="JPEG/WEBP quality (1-100)."),
