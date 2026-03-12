@@ -15,7 +15,7 @@ Usage:
 import io
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from typing import List, Optional, Tuple
 
 import httpx
@@ -46,6 +46,13 @@ _pipeline: Optional[PointToCountPipeline] = None
 _device: Optional[torch.device] = None
 
 
+def _inference_autocast():
+    """Use fp16 autocast on CUDA to unlock faster SDPA kernels (flash/mem-efficient)."""
+    if _device is not None and _device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return nullcontext()
+
+
 def _load_pipeline(
     checkpoint: str = "CNTQG_multitrain_ca44.pth",
     iou_threshold: float = 0.7,
@@ -71,6 +78,9 @@ async def lifespan(app: FastAPI):
     global _pipeline, _device
     logger.info("Loading SAM2+GECO2 pipeline …")
     _pipeline, _device = _load_pipeline()
+    if _device.type == "cuda":
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
     logger.info("Pipeline ready on %s", _device)
     logger.info("Auto-count will call AODC service at %s", AODC_SERVICE_URL)
     yield
@@ -301,7 +311,8 @@ def _run_inference(
     point_coords = torch.tensor(points, dtype=torch.float32, device=_device) * scale_zs
     point_labels = torch.tensor(labels, dtype=torch.int32, device=_device)
 
-    feats_zs = _pipeline.cnt.forward_backbone(img_tensor_zs)
+    with _inference_autocast():
+        feats_zs = _pipeline.cnt.forward_backbone(img_tensor_zs)
 
     # Scale expected_areas from original-image space to zero-shot 1024px space
     ea_tensor = None
@@ -309,13 +320,14 @@ def _run_inference(
         ea_tensor = torch.tensor(expected_areas, dtype=torch.float32, device=_device)
         ea_tensor = ea_tensor * (scale_zs ** 2)
 
-    exemplar_masks, exemplar_ious, exemplar_bboxes = \
-        _pipeline.cnt.sam_mask.predict_masks_from_points(
-            backbone_feats=feats_zs,
-            point_coords=point_coords,
-            point_labels=point_labels,
-            expected_areas=ea_tensor,
-        )
+    with _inference_autocast():
+        exemplar_masks, exemplar_ious, exemplar_bboxes = \
+            _pipeline.cnt.sam_mask.predict_masks_from_points(
+                backbone_feats=feats_zs,
+                point_coords=point_coords,
+                point_labels=point_labels,
+                expected_areas=ea_tensor,
+            )
 
     # Filter low-quality masks
     keep_mask = exemplar_ious >= _pipeline.iou_threshold
@@ -352,8 +364,9 @@ def _run_inference(
     img_tensor, bboxes_scaled, scale = _preprocess_image_with_bboxes(image, exemplar_bboxes_orig)
     image_size = float(img_tensor.shape[-1])  # 1024.0
 
-    feats = _pipeline.cnt.forward_backbone(img_tensor)
-    det_results = _pipeline.cnt.forward_detect(feats, bboxes_scaled, image_size=image_size)
+    with _inference_autocast():
+        feats = _pipeline.cnt.forward_backbone(img_tensor)
+        det_results = _pipeline.cnt.forward_detect(feats, bboxes_scaled, image_size=image_size)
 
     outputs = det_results[0]
     pred_boxes = outputs[0]["pred_boxes"]
@@ -406,8 +419,9 @@ def _run_inference_bbox(
     img_tensor, bboxes_scaled, scale = _preprocess_image_with_bboxes(image, bboxes)
     image_size = float(img_tensor.shape[-1])  # 1024.0
 
-    feats = _pipeline.cnt.forward_backbone(img_tensor)
-    det_results = _pipeline.cnt.forward_detect(feats, bboxes_scaled, image_size=image_size)
+    with _inference_autocast():
+        feats = _pipeline.cnt.forward_backbone(img_tensor)
+        det_results = _pipeline.cnt.forward_detect(feats, bboxes_scaled, image_size=image_size)
 
     outputs = det_results[0]
     pred_boxes_raw = outputs[0]["pred_boxes"]
@@ -480,12 +494,13 @@ def _generate_detection_masks(
     box_areas = (final_boxes_1024[:, 2] - final_boxes_1024[:, 0]) * \
                 (final_boxes_1024[:, 3] - final_boxes_1024[:, 1])
 
-    masks_1024, _, _ = _pipeline.cnt.sam_mask.predict_masks_from_points(
-        backbone_feats=backbone_feats,
-        point_coords=point_coords,
-        point_labels=point_labels,
-        expected_areas=box_areas,
-    )  # [N, 1024, 1024] bool
+    with _inference_autocast():
+        masks_1024, _, _ = _pipeline.cnt.sam_mask.predict_masks_from_points(
+            backbone_feats=backbone_feats,
+            point_coords=point_coords,
+            point_labels=point_labels,
+            expected_areas=box_areas,
+        )  # [N, 1024, 1024] bool
 
     # Crop padded region and resize to original image size
     padded_h = int(round(orig_h * scale))
@@ -937,7 +952,8 @@ def _generate_auto_exemplars_sam(
     Returns exemplar bboxes in original image pixel coordinates, or None if no masks survived.
     """
     img_tensor, scale_zs = _preprocess_image(image_np)
-    feats = _pipeline.cnt.forward_backbone(img_tensor)
+    with _inference_autocast():
+        feats = _pipeline.cnt.forward_backbone(img_tensor)
 
     # Uniform grid of foreground point prompts in 1024px padded space
     margin = 1024.0 / (grid_size + 1)
@@ -946,11 +962,12 @@ def _generate_auto_exemplars_sam(
     point_coords = torch.stack([xs.flatten(), ys.flatten()], dim=1).to(_device)
     point_labels = torch.ones(len(point_coords), dtype=torch.int32, device=_device)
 
-    masks, ious, bboxes = _pipeline.cnt.sam_mask.predict_masks_from_points(
-        backbone_feats=feats,
-        point_coords=point_coords,
-        point_labels=point_labels,
-    )
+    with _inference_autocast():
+        masks, ious, bboxes = _pipeline.cnt.sam_mask.predict_masks_from_points(
+            backbone_feats=feats,
+            point_coords=point_coords,
+            point_labels=point_labels,
+        )
 
     # Filter by IoU quality
     good = ious >= iou_thresh
