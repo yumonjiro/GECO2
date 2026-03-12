@@ -141,3 +141,69 @@ class AODCWrapper:
         y = row * orig_h / den_h
 
         return float(x), float(y)
+
+    @torch.no_grad()
+    def run_multi(
+        self,
+        image_np: np.ndarray,
+        num_peaks: int = 5,
+        min_distance: int = 15,
+        rel_threshold: float = 0.3,
+    ) -> dict:
+        """Return multiple density-map peaks and the raw density map.
+
+        Uses local-maximum detection with suppression radius to find distinct
+        high-density locations.
+
+        Args:
+            image_np: HWC uint8 numpy array (RGB).
+            num_peaks: Maximum number of peaks to return.
+            min_distance: Minimum separation (in density-map pixels) between peaks.
+            rel_threshold: Minimum peak value as fraction of global max.
+
+        Returns:
+            Dict with keys:
+                points: List of [x, y] in original image pixel space.
+                peak_indices: List of [row, col] in density-map pixel space.
+                density_map: np.ndarray [H_den, W_den] (float32).
+        """
+        from scipy.ndimage import maximum_filter, label
+
+        orig_h, orig_w = image_np.shape[:2]
+        aodc_h, aodc_w = self.input_size
+
+        img = torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
+        img = F.interpolate(
+            img.unsqueeze(0), size=(aodc_h, aodc_w), mode="bilinear", align_corners=False
+        )
+        img = _normalize(img.squeeze(0)).unsqueeze(0).to(self.device)
+
+        den_map = self._model(img, self._dummy_boxes, mode="test", categories=[])
+        den_map = F.relu(den_map.squeeze()).cpu().numpy()  # [H_den, W_den]
+        den_h, den_w = den_map.shape
+
+        if den_map.max() <= 0:
+            return {"points": [], "peak_indices": [], "density_map": den_map}
+
+        # Local maximum detection
+        local_max = maximum_filter(den_map, size=min_distance * 2 + 1)
+        is_peak = (den_map == local_max) & (den_map > den_map.max() * rel_threshold)
+
+        peak_rows, peak_cols = np.where(is_peak)
+        if len(peak_rows) == 0:
+            return {"points": [], "peak_indices": [], "density_map": den_map}
+
+        # Sort by density value (descending) and take top N
+        peak_vals = den_map[peak_rows, peak_cols]
+        order = np.argsort(-peak_vals)[:num_peaks]
+        peak_rows, peak_cols = peak_rows[order], peak_cols[order]
+
+        points = []
+        peak_indices = []
+        for r, c in zip(peak_rows, peak_cols):
+            x = float(c) * orig_w / den_w
+            y = float(r) * orig_h / den_h
+            points.append([x, y])
+            peak_indices.append([int(r), int(c)])
+
+        return {"points": points, "peak_indices": peak_indices, "density_map": den_map}

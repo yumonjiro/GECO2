@@ -9,6 +9,7 @@ Usage:
     uvicorn aodc_server:app --host 0.0.0.0 --port 7861
 """
 
+import base64
 import io
 import logging
 import os
@@ -99,6 +100,43 @@ async def predict(
 
     x, y = _aodc.run(image_np)
     return JSONResponse({"x": x, "y": y})
+
+
+@app.post("/predict_multi")
+async def predict_multi(
+    image: UploadFile = File(..., description="Input image (JPEG/PNG)"),
+    num_peaks: int = 5,
+    min_distance: int = 15,
+    rel_threshold: float = 0.3,
+):
+    """Extract multiple density-map peaks from image.
+
+    **Response**:
+    ```json
+    {"points": [[x1, y1], [x2, y2], ...]}
+    ```
+    """
+    try:
+        contents = await image.read()
+        pil = Image.open(io.BytesIO(contents)).convert("RGB")
+        image_np = np.array(pil)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
+
+    points = _aodc.run_multi(
+        image_np, num_peaks=num_peaks,
+        min_distance=min_distance, rel_threshold=rel_threshold,
+    )
+    # Encode density map as base64 for geco2 area estimation
+    den_map = points["density_map"]
+    den_bytes = den_map.astype(np.float32).tobytes()
+    den_b64 = base64.b64encode(den_bytes).decode("ascii")
+    return JSONResponse({
+        "points": points["points"],
+        "peak_indices": points["peak_indices"],
+        "density_map_b64": den_b64,
+        "den_shape": list(den_map.shape),
+    })
 
 
 if __name__ == "__main__":

@@ -144,6 +144,7 @@ class MaskProcessor(nn.Module):
         point_labels: torch.Tensor,
         multimask_output: bool = True,
         mask_select_index: int = 2,
+        expected_areas: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Generate segmentation masks from point prompts using pre-computed backbone features.
 
@@ -153,6 +154,9 @@ class MaskProcessor(nn.Module):
             point_labels: Point labels [N], 1=foreground, 0=background.
             multimask_output: Whether to output multiple masks per point.
             mask_select_index: Which mask to select from multimask output (default=2, usually best).
+            expected_areas: Optional [N] tensor of expected object areas in image_size² pixel units.
+                When provided, selects the mask (out of 3) whose area is closest to the expected area
+                instead of using the fixed mask_select_index.
 
         Returns:
             masks: Binary masks [N, H, W] at image_size resolution.
@@ -197,13 +201,29 @@ class MaskProcessor(nn.Module):
                 high_res_features=features[:-1],
             )
 
-            # Select best mask and upscale to full resolution
-            selected_ious = iou_predictions[:, mask_select_index]
-            masks = F.interpolate(
+            # Select mask: area-based if expected_areas given, else fixed index
+            masks_full = F.interpolate(
                 low_res_masks, (self.image_size, self.image_size),
                 mode="bilinear", align_corners=False,
-            )
-            masks = masks[:, mask_select_index] > 0  # [B, H, W]
+            )  # [B, 3, H, W]
+
+            batch_expected = None
+            if expected_areas is not None:
+                batch_expected = expected_areas[start:start + step]  # [B]
+
+            if batch_expected is not None and multimask_output:
+                # Compute area of each of the 3 masks
+                mask_areas = (masks_full > 0).flatten(2).sum(dim=2).float()  # [B, 3]
+                # Select index with area closest to expected
+                diff = (mask_areas - batch_expected.unsqueeze(1)).abs()  # [B, 3]
+                best_idx = diff.argmin(dim=1)  # [B]
+                B = masks_full.shape[0]
+                arange = torch.arange(B, device=masks_full.device)
+                selected_ious = iou_predictions[arange, best_idx]
+                masks = masks_full[arange, best_idx] > 0  # [B, H, W]
+            else:
+                selected_ious = iou_predictions[:, mask_select_index]
+                masks = masks_full[:, mask_select_index] > 0  # [B, H, W]
 
             # Extract bounding boxes from masks (vectorized)
             bboxes = self._masks_to_bboxes(masks)

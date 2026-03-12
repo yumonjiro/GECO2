@@ -28,6 +28,7 @@ from torchvision import transforms as T
 import torchvision.ops as ops
 
 from models.counter_infer import build_model
+from utils.area_estimation import estimate_object_areas
 from models.point_to_count import PointToCountPipeline
 from utils.arg_parser import get_argparser
 from utils.data import resize_and_pad
@@ -88,6 +89,32 @@ app = FastAPI(
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _decode_aodc_areas(
+    aodc_result: dict, orig_h: int, orig_w: int,
+) -> Optional[List[float]]:
+    """Decode AODC response and estimate per-peak object areas.
+
+    Returns None if the response doesn't contain density map data
+    (backward compatible with older AODC servers).
+    """
+    import base64
+
+    den_b64 = aodc_result.get("density_map_b64")
+    peak_indices = aodc_result.get("peak_indices")
+    den_shape = aodc_result.get("den_shape")
+    if not den_b64 or not peak_indices or not den_shape:
+        return None
+
+    den_bytes = base64.b64decode(den_b64)
+    density_map = np.frombuffer(den_bytes, dtype=np.float32).reshape(den_shape)
+    return estimate_object_areas(
+        density_map,
+        peak_indices=[(r, c) for r, c in peak_indices],
+        orig_h=orig_h,
+        orig_w=orig_w,
+    )
+
+
 def _preprocess_image(image: np.ndarray) -> Tuple[torch.Tensor, float]:
     """Normalize, resize-and-pad to [1, 3, 1024, 1024] (zero-shot mode, no exemplar bboxes)."""
     tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
@@ -121,6 +148,7 @@ def _run_inference(
     points: List[List[float]],
     labels: List[int],
     threshold: float = 0.33,
+    expected_areas: Optional[List[float]] = None,
 ):
     """Core inference: image + points → boxes + count (two-pass with adaptive scaling).
 
@@ -129,6 +157,11 @@ def _run_inference(
 
     This matches demo_gradio.py / /predict_bbox quality because the detection pass
     uses the same adaptive scaling (~80 px objects) that the model was trained with.
+
+    Args:
+        expected_areas: Optional per-point expected object areas in original-image
+            pixel² units (from AODC density map). When provided, SAM2 selects
+            the mask whose area is closest to the expected size.
     """
     # --- Pass 1: SAM2 exemplar extraction at zero-shot scale ---
     img_tensor_zs, scale_zs = _preprocess_image(image)
@@ -136,11 +169,19 @@ def _run_inference(
     point_labels = torch.tensor(labels, dtype=torch.int32, device=_device)
 
     feats_zs = _pipeline.cnt.forward_backbone(img_tensor_zs)
+
+    # Scale expected_areas from original-image space to zero-shot 1024px space
+    ea_tensor = None
+    if expected_areas is not None:
+        ea_tensor = torch.tensor(expected_areas, dtype=torch.float32, device=_device)
+        ea_tensor = ea_tensor * (scale_zs ** 2)
+
     exemplar_masks, exemplar_ious, exemplar_bboxes = \
         _pipeline.cnt.sam_mask.predict_masks_from_points(
             backbone_feats=feats_zs,
             point_coords=point_coords,
             point_labels=point_labels,
+            expected_areas=ea_tensor,
         )
 
     # Filter low-quality masks
@@ -430,11 +471,11 @@ async def predict_auto(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
 
-    # --- Call AODC service to get seed point ---
+    # --- Call AODC service to get multiple seed points ---
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
-                f"{AODC_SERVICE_URL}/predict",
+                f"{AODC_SERVICE_URL}/predict_multi",
                 files={"image": (image.filename or "image.jpg", contents, "image/jpeg")},
             )
             resp.raise_for_status()
@@ -451,14 +492,20 @@ async def predict_auto(
             detail=f"AODC service returned error: {e.response.status_code} {e.response.text}",
         )
 
-    x, y = float(aodc_result["x"]), float(aodc_result["y"])
+    points = aodc_result.get("points", [])
+    if not points:
+        return JSONResponse({"count": 0, "pred_boxes": [], "exemplar_boxes": []})
 
-    # --- Run local SAM2+GECO2 pipeline with the AODC seed point ---
+    # Decode density map and estimate per-object areas
+    expected_areas = _decode_aodc_areas(aodc_result, image_np.shape[0], image_np.shape[1])
+
+    # --- Run local SAM2+GECO2 pipeline with the AODC seed points ---
     pred_boxes, count, exemplar_boxes = _run_inference(
         image_np,
-        points=[[x, y]],
-        labels=[1],
+        points=points,
+        labels=[1] * len(points),
         threshold=threshold,
+        expected_areas=expected_areas,
     )
 
     return JSONResponse({
@@ -489,7 +536,7 @@ async def predict_auto_image(
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
-                f"{AODC_SERVICE_URL}/predict",
+                f"{AODC_SERVICE_URL}/predict_multi",
                 files={"image": (image.filename or "image.jpg", contents, "image/jpeg")},
             )
             resp.raise_for_status()
@@ -505,9 +552,16 @@ async def predict_auto_image(
             detail=f"AODC service returned error: {e.response.status_code} {e.response.text}",
         )
 
-    x, y = float(aodc_result["x"]), float(aodc_result["y"])
+    points = aodc_result.get("points", [])
+    if not points:
+        return _image_response(_draw_boxes(pil, [], [], 0))
+
+    # Decode density map and estimate per-object areas
+    expected_areas = _decode_aodc_areas(aodc_result, image_np.shape[0], image_np.shape[1])
+
     pred_boxes, count, exemplar_boxes = _run_inference(
-        image_np, points=[[x, y]], labels=[1], threshold=threshold,
+        image_np, points=points, labels=[1] * len(points), threshold=threshold,
+        expected_areas=expected_areas,
     )
     return _image_response(_draw_boxes(pil, pred_boxes, exemplar_boxes, count))
 
@@ -581,6 +635,173 @@ async def predict_bbox_image(
         raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
 
     pred_boxes, count, exemplar_boxes = _run_inference_bbox(image_np, bboxes_list, threshold=threshold)
+    return _image_response(_draw_boxes(pil, pred_boxes, exemplar_boxes, count))
+
+
+# ---------------------------------------------------------------------------
+# SAM2 grid-based automatic exemplar generation
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _generate_auto_exemplars_sam(
+    image_np: np.ndarray,
+    grid_size: int = 16,
+    iou_thresh: float = 0.7,
+    nms_thresh: float = 0.5,
+    num_exemplars: int = 3,
+) -> Optional[List[List[float]]]:
+    """Generate exemplar BBs automatically via SAM2 grid-point mask generation.
+
+    1. Preprocess image (zero-shot scale)
+    2. Run backbone
+    3. Create grid_size x grid_size uniform point prompts
+    4. SAM2 predict_masks_from_points → masks, IoU scores, bboxes
+    5. Filter by IoU → NMS
+    6. Cluster surviving bboxes by area (log-scale histogram) → find mode
+    7. Return top-N exemplars from the most common size group
+
+    Returns exemplar bboxes in original image pixel coordinates, or None if no masks survived.
+    """
+    img_tensor, scale_zs = _preprocess_image(image_np)
+    feats = _pipeline.cnt.forward_backbone(img_tensor)
+
+    # Uniform grid of foreground point prompts in 1024px padded space
+    margin = 1024.0 / (grid_size + 1)
+    grid = torch.linspace(margin, 1024.0 - margin, grid_size)
+    ys, xs = torch.meshgrid(grid, grid, indexing="ij")
+    point_coords = torch.stack([xs.flatten(), ys.flatten()], dim=1).to(_device)
+    point_labels = torch.ones(len(point_coords), dtype=torch.int32, device=_device)
+
+    masks, ious, bboxes = _pipeline.cnt.sam_mask.predict_masks_from_points(
+        backbone_feats=feats,
+        point_coords=point_coords,
+        point_labels=point_labels,
+    )
+
+    # Filter by IoU quality
+    good = ious >= iou_thresh
+    if good.sum() == 0:
+        good = ious >= ious.max() * 0.5
+    bboxes = bboxes[good]
+    ious = ious[good]
+
+    if bboxes.numel() == 0:
+        return None
+
+    # Remove near-zero-area boxes
+    areas = (bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])
+    valid = areas > 4.0  # at least 2x2 px
+    bboxes, ious, areas = bboxes[valid], ious[valid], areas[valid]
+    if bboxes.numel() == 0:
+        return None
+
+    # NMS to remove duplicates/overlaps
+    keep = ops.nms(bboxes, ious, nms_thresh)
+    bboxes, ious, areas = bboxes[keep], ious[keep], areas[keep]
+
+    if len(bboxes) <= num_exemplars:
+        return (bboxes / scale_zs).cpu().tolist()
+
+    # Cluster by area: log-scale histogram → find the peak bin
+    log_areas = torch.log(areas + 1).cpu().numpy()
+    n_bins = max(5, min(20, len(log_areas) // 3))
+    counts, bin_edges = np.histogram(log_areas, bins=n_bins)
+    peak_bin = int(counts.argmax())
+    bin_lo, bin_hi = bin_edges[peak_bin], bin_edges[peak_bin + 1]
+
+    in_peak = (log_areas >= bin_lo) & (log_areas <= bin_hi)
+    if in_peak.sum() == 0:
+        in_peak = np.ones(len(log_areas), dtype=bool)
+
+    peak_bboxes = bboxes[in_peak]
+    peak_ious = ious[in_peak]
+
+    # Take top exemplars by IoU from the most common size group
+    top_k = min(num_exemplars, len(peak_bboxes))
+    top_idx = peak_ious.argsort(descending=True)[:top_k]
+    exemplar_bboxes = peak_bboxes[top_idx]
+
+    return (exemplar_bboxes / scale_zs).cpu().tolist()
+
+
+@torch.no_grad()
+def _run_inference_auto_sam(
+    image_np: np.ndarray,
+    threshold: float = 0.33,
+    grid_size: int = 16,
+    num_exemplars: int = 3,
+):
+    """Automatic counting via SAM2 grid masks → exemplar BBs → GECO2 detection."""
+    exemplar_bboxes_orig = _generate_auto_exemplars_sam(
+        image_np, grid_size=grid_size, num_exemplars=num_exemplars,
+    )
+    if exemplar_bboxes_orig is None:
+        return [], 0, []
+
+    # Use the same adaptive-scaling detection path as /predict_bbox
+    return _run_inference_bbox(image_np, exemplar_bboxes_orig, threshold=threshold)
+
+
+@app.post("/predict_auto_sam")
+async def predict_auto_sam(
+    image: UploadFile = File(..., description="Input image (JPEG/PNG)"),
+    threshold: float = Form(default=0.33, description="Detection confidence threshold (0.05–0.95)"),
+    grid_size: int = Form(default=16, description="Grid density per side (default 16 → 256 points)"),
+    num_exemplars: int = Form(default=3, description="Number of exemplar BBs to select (1–10)"),
+):
+    """Fully automatic counting using SAM2 grid-based mask generation.
+
+    Generates masks from a uniform grid of points using SAM2, clusters them
+    by object size, selects representative exemplars, and feeds them to GECO2.
+
+    No external service (AODC) needed — works entirely within the GECO2 container.
+
+    **Request** (multipart/form-data):
+    - `image`: image file
+    - `threshold` *(optional)*: float, default 0.33
+    - `grid_size` *(optional)*: int, default 16 (16×16=256 point prompts)
+    - `num_exemplars` *(optional)*: int, default 3
+
+    **Response**:
+    ```json
+    {
+      "count": 42,
+      "pred_boxes": [[x1,y1,x2,y2], ...],
+      "exemplar_boxes": [[x1,y1,x2,y2], ...]
+    }
+    ```
+    """
+    try:
+        contents = await image.read()
+        pil = Image.open(io.BytesIO(contents)).convert("RGB")
+        image_np = np.array(pil)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
+
+    pred_boxes, count, exemplar_boxes = _run_inference_auto_sam(
+        image_np, threshold=threshold, grid_size=grid_size, num_exemplars=num_exemplars,
+    )
+    return JSONResponse({"count": count, "pred_boxes": pred_boxes, "exemplar_boxes": exemplar_boxes})
+
+
+@app.post("/predict_auto_sam/image", response_class=StreamingResponse)
+async def predict_auto_sam_image(
+    image: UploadFile = File(..., description="Input image (JPEG/PNG)"),
+    threshold: float = Form(default=0.33, description="Detection confidence threshold (0.05–0.95)"),
+    grid_size: int = Form(default=16, description="Grid density per side (default 16 → 256 points)"),
+    num_exemplars: int = Form(default=3, description="Number of exemplar BBs to select (1–10)"),
+):
+    """Same as /predict_auto_sam but returns a PNG image with bounding boxes drawn on it."""
+    try:
+        contents = await image.read()
+        pil = Image.open(io.BytesIO(contents)).convert("RGB")
+        image_np = np.array(pil)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
+
+    pred_boxes, count, exemplar_boxes = _run_inference_auto_sam(
+        image_np, threshold=threshold, grid_size=grid_size, num_exemplars=num_exemplars,
+    )
     return _image_response(_draw_boxes(pil, pred_boxes, exemplar_boxes, count))
 
 
