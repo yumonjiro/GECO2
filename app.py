@@ -54,14 +54,25 @@ def post_process(image, outputs, masks, img, scale, drawn_boxes, enable_mask, th
 
     pred_boxes = outputs[idx]['pred_boxes'][outputs[idx]['box_v'] > outputs[idx]['box_v'].max() / threshold][keep]
     pred_boxes = torch.clamp(pred_boxes, 0, 1)
-
-    pred_boxes = (pred_boxes.cpu() / scale * img.shape[-1]).tolist()
+    pred_boxes_draw = (pred_boxes.cpu() / scale * img.shape[-1]).tolist()
 
     image = Image.fromarray((image).astype(np.uint8))
 
     if enable_mask:
         from matplotlib import pyplot as plt
-        masks_ = masks[idx][(outputs[idx]['box_v'] > outputs[idx]['box_v'].max() / threshold)[0]]
+        masks_ = masks[idx][(outputs[idx]['box_v'] > outputs[idx]['box_v'].max() / threshold)[0]][keep]
+        boxes_1024 = pred_boxes * img.shape[-1]
+        clipped_masks = torch.zeros_like(masks_, dtype=torch.bool)
+        h, w = masks_.shape[-2], masks_.shape[-1]
+        for i, (x1, y1, x2, y2) in enumerate(boxes_1024):
+            x1i = int(torch.floor(x1).clamp(0, w - 1).item())
+            y1i = int(torch.floor(y1).clamp(0, h - 1).item())
+            x2i = int(torch.ceil(x2).clamp(0, w).item())
+            y2i = int(torch.ceil(y2).clamp(0, h).item())
+            if x2i <= x1i or y2i <= y1i:
+                continue
+            clipped_masks[i, y1i:y2i, x1i:x2i] = masks_[i, y1i:y2i, x1i:x2i]
+        masks_ = clipped_masks
         N_masks = masks_.shape[0]
         indices = torch.randint(1, N_masks + 1, (1, N_masks), device=masks_.device).view(-1, 1, 1)
         masks = (masks_ * indices).sum(dim=0)
@@ -83,7 +94,7 @@ def post_process(image, outputs, masks, img, scale, drawn_boxes, enable_mask, th
 
 
     draw = ImageDraw.Draw(image)
-    for box in pred_boxes:
+    for box in pred_boxes_draw:
         draw.rectangle([box[0], box[1], box[2], box[3]], outline="orange", width=5)
     # for box in drawn_boxes:
     #     draw.rectangle([box[0], box[1], box[3], box[4]], outline="red", width=3)
@@ -101,7 +112,7 @@ def post_process(image, outputs, masks, img, scale, drawn_boxes, enable_mask, th
     # text_y = y1 + (square_size - 10) / 2
     # draw.text((text_x, text_y), txt, fill="white", font=font)
 
-    return image, len(pred_boxes)
+    return image, len(pred_boxes_draw)
 
 
 iface = gr.Blocks()
@@ -167,4 +178,3 @@ with iface:
     )
 
 iface.launch(share=True)
-

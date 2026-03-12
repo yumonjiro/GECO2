@@ -14,7 +14,7 @@ def estimate_object_areas(
     peak_indices: List[Tuple[int, int]],
     orig_h: int,
     orig_w: int,
-    half_max_ratio: float = 0.5,
+    half_max_ratio: float = 0.1,
 ) -> List[float]:
     """Estimate the area (in original-image pixels²) of the object at each peak.
 

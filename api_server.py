@@ -377,15 +377,17 @@ def _run_inference(
 
     # SAM2 masks on detected boxes (in 1024 space)
     boxes_1024 = final_boxes * image_size  # [0,1] → pixel in 1024-padded image
+    final_boxes_orig_t = final_boxes / scale * image_size
     masks_np = _generate_detection_masks(
         backbone_feats=feats,
         final_boxes_1024=boxes_1024,
+        final_boxes_orig=final_boxes_orig_t,
         scale=scale,
         orig_h=image.shape[0],
         orig_w=image.shape[1],
     )
 
-    final_boxes = (final_boxes / scale * image_size).cpu().tolist()
+    final_boxes = final_boxes_orig_t.cpu().tolist()
 
     return final_boxes, len(final_boxes), exemplar_bboxes_orig, masks_np
 
@@ -429,15 +431,17 @@ def _run_inference_bbox(
 
     # SAM2 masks on detected boxes (in 1024 space)
     boxes_1024 = final_boxes * image_size
+    final_boxes_orig_t = final_boxes / scale * image_size
     masks_np = _generate_detection_masks(
         backbone_feats=feats,
         final_boxes_1024=boxes_1024,
+        final_boxes_orig=final_boxes_orig_t,
         scale=scale,
         orig_h=image.shape[0],
         orig_w=image.shape[1],
     )
 
-    final_boxes = (final_boxes / scale * image_size).cpu().tolist()
+    final_boxes = final_boxes_orig_t.cpu().tolist()
 
     return final_boxes, len(final_boxes), bboxes, masks_np
 
@@ -446,6 +450,7 @@ def _run_inference_bbox(
 def _generate_detection_masks(
     backbone_feats: dict,
     final_boxes_1024: torch.Tensor,
+    final_boxes_orig: torch.Tensor,
     scale: float,
     orig_h: int,
     orig_w: int,
@@ -455,6 +460,7 @@ def _generate_detection_masks(
     Args:
         backbone_feats: Pass 2 backbone output (1024-space).
         final_boxes_1024: Detected boxes [N, 4] in 1024-padded pixel coords (x1, y1, x2, y2).
+        final_boxes_orig: Detected boxes [N, 4] in original-image pixel coords.
         scale: Scale factor from resize_and_pad.
         orig_h, orig_w: Original image dimensions.
 
@@ -491,7 +497,22 @@ def _generate_detection_masks(
         mode="nearest",
     ).squeeze(1) > 0.5  # [N, orig_h, orig_w]
 
-    return masks_resized.cpu().numpy()
+    masks_np = masks_resized.cpu().numpy()
+
+    # Hard-clip each mask to its corresponding detected bounding box in original space.
+    # This removes occasional SAM2 leakage outside the box sent to clients.
+    clipped_masks = np.zeros_like(masks_np, dtype=bool)
+    boxes_np = final_boxes_orig.detach().cpu().numpy()
+    for i, (x1, y1, x2, y2) in enumerate(boxes_np):
+        x1i = max(0, min(orig_w - 1, int(np.floor(x1))))
+        y1i = max(0, min(orig_h - 1, int(np.floor(y1))))
+        x2i = max(0, min(orig_w, int(np.ceil(x2))))
+        y2i = max(0, min(orig_h, int(np.ceil(y2))))
+        if x2i <= x1i or y2i <= y1i:
+            continue
+        clipped_masks[i, y1i:y2i, x1i:x2i] = masks_np[i, y1i:y2i, x1i:x2i]
+
+    return clipped_masks
 
 
 def _draw_boxes(
