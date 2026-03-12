@@ -324,7 +324,7 @@ def _run_inference(
     exemplar_bboxes_px = exemplar_bboxes[keep_mask]  # pixel coords in the 1024-padded space
 
     if exemplar_bboxes_px.numel() == 0:
-        return [], 0, exemplar_bboxes.cpu().tolist()
+        return [], 0, exemplar_bboxes.cpu().tolist(), None
 
     # Convert SAM bboxes back to original image coordinates
     exemplar_bboxes_orig = (exemplar_bboxes_px / scale_zs).cpu().tolist()
@@ -339,7 +339,7 @@ def _run_inference(
     exemplar_bboxes_orig = _filter_exemplars_by_shape(exemplar_bboxes_orig)
 
     if not exemplar_bboxes_orig:
-        return [], 0, []
+        return [], 0, [], None
 
     # Select the single best exemplar (median area) for GECO2
     if len(exemplar_bboxes_orig) > 1:
@@ -364,19 +364,30 @@ def _run_inference(
         box_v = box_v[0]
 
     if box_v.numel() == 0:
-        return [], 0, exemplar_bboxes_orig
+        return [], 0, exemplar_bboxes_orig, None
 
     thr_inv = 1.0 / threshold
     sel = box_v > (box_v.max() / thr_inv)
     if sel.sum() == 0:
-        return [], 0, exemplar_bboxes_orig
+        return [], 0, exemplar_bboxes_orig, None
 
     keep = ops.nms(pred_boxes[sel], box_v[sel], 0.5)
     final_boxes = pred_boxes[sel][keep]
     final_boxes = torch.clamp(final_boxes, 0, 1)
+
+    # SAM2 masks on detected boxes (in 1024 space)
+    boxes_1024 = final_boxes * image_size  # [0,1] → pixel in 1024-padded image
+    masks_np = _generate_detection_masks(
+        backbone_feats=feats,
+        final_boxes_1024=boxes_1024,
+        scale=scale,
+        orig_h=image.shape[0],
+        orig_w=image.shape[1],
+    )
+
     final_boxes = (final_boxes / scale * image_size).cpu().tolist()
 
-    return final_boxes, len(final_boxes), exemplar_bboxes_orig
+    return final_boxes, len(final_boxes), exemplar_bboxes_orig, masks_np
 
 
 @torch.no_grad()
@@ -405,19 +416,82 @@ def _run_inference_bbox(
         box_v = box_v[0]
 
     if box_v.numel() == 0:
-        return [], 0, bboxes
+        return [], 0, bboxes, None
 
     thr_inv = 1.0 / threshold
     sel = box_v > (box_v.max() / thr_inv)
     if sel.sum() == 0:
-        return [], 0, bboxes
+        return [], 0, bboxes, None
 
     keep = ops.nms(pred_boxes_raw[sel], box_v[sel], 0.5)
     final_boxes = pred_boxes_raw[sel][keep]
     final_boxes = torch.clamp(final_boxes, 0, 1)
+
+    # SAM2 masks on detected boxes (in 1024 space)
+    boxes_1024 = final_boxes * image_size
+    masks_np = _generate_detection_masks(
+        backbone_feats=feats,
+        final_boxes_1024=boxes_1024,
+        scale=scale,
+        orig_h=image.shape[0],
+        orig_w=image.shape[1],
+    )
+
     final_boxes = (final_boxes / scale * image_size).cpu().tolist()
 
-    return final_boxes, len(final_boxes), bboxes
+    return final_boxes, len(final_boxes), bboxes, masks_np
+
+
+@torch.no_grad()
+def _generate_detection_masks(
+    backbone_feats: dict,
+    final_boxes_1024: torch.Tensor,
+    scale: float,
+    orig_h: int,
+    orig_w: int,
+) -> Optional[np.ndarray]:
+    """Run SAM2 on detected box centres to produce per-object masks.
+
+    Args:
+        backbone_feats: Pass 2 backbone output (1024-space).
+        final_boxes_1024: Detected boxes [N, 4] in 1024-padded pixel coords (x1, y1, x2, y2).
+        scale: Scale factor from resize_and_pad.
+        orig_h, orig_w: Original image dimensions.
+
+    Returns:
+        masks_np: Boolean array [N, orig_h, orig_w] or None if no boxes.
+    """
+    if final_boxes_1024.numel() == 0:
+        return None
+
+    # Centre points of detected boxes
+    cx = (final_boxes_1024[:, 0] + final_boxes_1024[:, 2]) / 2
+    cy = (final_boxes_1024[:, 1] + final_boxes_1024[:, 3]) / 2
+    point_coords = torch.stack([cx, cy], dim=1)  # [N, 2]
+    point_labels = torch.ones(len(point_coords), dtype=torch.int32, device=point_coords.device)
+
+    # Expected areas from box sizes (helps mask selection)
+    box_areas = (final_boxes_1024[:, 2] - final_boxes_1024[:, 0]) * \
+                (final_boxes_1024[:, 3] - final_boxes_1024[:, 1])
+
+    masks_1024, _, _ = _pipeline.cnt.sam_mask.predict_masks_from_points(
+        backbone_feats=backbone_feats,
+        point_coords=point_coords,
+        point_labels=point_labels,
+        expected_areas=box_areas,
+    )  # [N, 1024, 1024] bool
+
+    # Crop padded region and resize to original image size
+    padded_h = int(round(orig_h * scale))
+    padded_w = int(round(orig_w * scale))
+    masks_crop = masks_1024[:, :padded_h, :padded_w]  # remove padding
+    masks_resized = torch.nn.functional.interpolate(
+        masks_crop.unsqueeze(1).float(),
+        size=(orig_h, orig_w),
+        mode="nearest",
+    ).squeeze(1) > 0.5  # [N, orig_h, orig_w]
+
+    return masks_resized.cpu().numpy()
 
 
 def _draw_boxes(
@@ -425,14 +499,27 @@ def _draw_boxes(
     pred_boxes: List[List[float]],
     exemplar_boxes: List[List[float]],
     count: int,
+    masks: Optional[np.ndarray] = None,
 ) -> Image.Image:
-    """Draw bounding boxes on a copy of the image and return it.
+    """Draw bounding boxes and optional masks on a copy of the image.
 
-    pred_boxes    → green rectangles (detected objects)
+    pred_boxes     → green rectangles (detected objects)
     exemplar_boxes → red rectangles (exemplar / query objects)
+    masks          → semi-transparent green overlay per detected object
     Count is rendered in the top-left corner.
     """
-    img = pil_image.copy().convert("RGB")
+    img = pil_image.copy().convert("RGBA")
+
+    # Draw semi-transparent mask overlay
+    if masks is not None and len(masks) > 0:
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        overlay_np = np.array(overlay)
+        combined = np.any(masks, axis=0)  # [H, W]
+        overlay_np[combined] = (60, 220, 60, 80)  # green, alpha=80/255
+        overlay = Image.fromarray(overlay_np, "RGBA")
+        img = Image.alpha_composite(img, overlay)
+
+    img = img.convert("RGB")
     draw = ImageDraw.Draw(img)
 
     for box in exemplar_boxes:
@@ -533,7 +620,7 @@ async def predict(
         raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
 
     # --- Inference ---
-    pred_boxes, count, exemplar_boxes = _run_inference(
+    pred_boxes, count, exemplar_boxes, _masks = _run_inference(
         image_np, points_list, labels_list, threshold=threshold,
     )
 
@@ -587,10 +674,10 @@ async def predict_image(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
 
-    pred_boxes, count, exemplar_boxes = _run_inference(
+    pred_boxes, count, exemplar_boxes, masks = _run_inference(
         image_np, points_list, labels_list, threshold=threshold,
     )
-    return _image_response(_draw_boxes(pil, pred_boxes, exemplar_boxes, count))
+    return _image_response(_draw_boxes(pil, pred_boxes, exemplar_boxes, count, masks=masks))
 
 
 @app.post("/predict_auto")
@@ -659,7 +746,7 @@ async def predict_auto(
         return JSONResponse({"count": 0, "pred_boxes": [], "exemplar_boxes": []})
 
     # --- Run local SAM2+GECO2 pipeline with the AODC seed points ---
-    pred_boxes, count, exemplar_boxes = _run_inference(
+    pred_boxes, count, exemplar_boxes, _masks = _run_inference(
         image_np,
         points=points,
         labels=[1] * len(points),
@@ -725,11 +812,11 @@ async def predict_auto_image(
     if not points:
         return _image_response(_draw_boxes(pil, [], [], 0))
 
-    pred_boxes, count, exemplar_boxes = _run_inference(
+    pred_boxes, count, exemplar_boxes, masks = _run_inference(
         image_np, points=points, labels=[1] * len(points), threshold=threshold,
         expected_areas=expected_areas,
     )
-    return _image_response(_draw_boxes(pil, pred_boxes, exemplar_boxes, count))
+    return _image_response(_draw_boxes(pil, pred_boxes, exemplar_boxes, count, masks=masks))
 
 
 @app.post("/predict_bbox")
@@ -773,7 +860,7 @@ async def predict_bbox(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
 
-    pred_boxes, count, exemplar_boxes = _run_inference_bbox(image_np, bboxes_list, threshold=threshold)
+    pred_boxes, count, exemplar_boxes, _masks = _run_inference_bbox(image_np, bboxes_list, threshold=threshold)
     return JSONResponse({"count": count, "pred_boxes": pred_boxes, "exemplar_boxes": exemplar_boxes})
 
 
@@ -800,8 +887,8 @@ async def predict_bbox_image(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
 
-    pred_boxes, count, exemplar_boxes = _run_inference_bbox(image_np, bboxes_list, threshold=threshold)
-    return _image_response(_draw_boxes(pil, pred_boxes, exemplar_boxes, count))
+    pred_boxes, count, exemplar_boxes, masks = _run_inference_bbox(image_np, bboxes_list, threshold=threshold)
+    return _image_response(_draw_boxes(pil, pred_boxes, exemplar_boxes, count, masks=masks))
 
 
 # ---------------------------------------------------------------------------
@@ -902,7 +989,7 @@ def _run_inference_auto_sam(
         image_np, grid_size=grid_size, num_exemplars=num_exemplars,
     )
     if exemplar_bboxes_orig is None:
-        return [], 0, []
+        return [], 0, [], None
 
     # Use the same adaptive-scaling detection path as /predict_bbox
     return _run_inference_bbox(image_np, exemplar_bboxes_orig, threshold=threshold)
@@ -944,7 +1031,7 @@ async def predict_auto_sam(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
 
-    pred_boxes, count, exemplar_boxes = _run_inference_auto_sam(
+    pred_boxes, count, exemplar_boxes, _masks = _run_inference_auto_sam(
         image_np, threshold=threshold, grid_size=grid_size, num_exemplars=num_exemplars,
     )
     return JSONResponse({"count": count, "pred_boxes": pred_boxes, "exemplar_boxes": exemplar_boxes})
@@ -965,10 +1052,10 @@ async def predict_auto_sam_image(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
 
-    pred_boxes, count, exemplar_boxes = _run_inference_auto_sam(
+    pred_boxes, count, exemplar_boxes, masks = _run_inference_auto_sam(
         image_np, threshold=threshold, grid_size=grid_size, num_exemplars=num_exemplars,
     )
-    return _image_response(_draw_boxes(pil, pred_boxes, exemplar_boxes, count))
+    return _image_response(_draw_boxes(pil, pred_boxes, exemplar_boxes, count, masks=masks))
 
 
 # ---------------------------------------------------------------------------
