@@ -115,6 +115,48 @@ def _decode_aodc_areas(
     )
 
 
+def _filter_exemplars_by_area(
+    bboxes: List[List[float]],
+    area_ratio: float = 3.0,
+) -> List[List[float]]:
+    """Remove exemplar BBs that are much smaller than the rest (e.g. holes).
+
+    When AODC picks peaks on both a "hole" and the surrounding object,
+    SAM2 produces exemplars with very different sizes.  Holes are always
+    smaller than the real objects, so we find the biggest area gap and
+    keep the *larger-area* side.
+
+    Algorithm:
+        1. Sort BBs by area (ascending).
+        2. Find the largest ratio gap between consecutive areas.
+        3. If that gap exceeds *area_ratio*, split there and keep
+           the larger-area group (everything after the gap).
+        4. Otherwise keep all (sizes are uniform enough).
+    """
+    if len(bboxes) <= 1:
+        return bboxes
+
+    areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in bboxes]
+    indices = sorted(range(len(bboxes)), key=lambda i: areas[i])
+
+    # Find the biggest ratio gap between consecutively-sorted areas
+    max_gap_ratio = 0.0
+    split_pos = -1  # index in sorted list *after* which to split
+    for i in range(1, len(indices)):
+        smaller = max(areas[indices[i - 1]], 1e-6)
+        ratio = areas[indices[i]] / smaller
+        if ratio > max_gap_ratio:
+            max_gap_ratio = ratio
+            split_pos = i
+
+    if max_gap_ratio <= area_ratio:
+        return bboxes  # all sizes are similar enough
+
+    # Keep the larger-area group (everything from split_pos onward)
+    keep = indices[split_pos:]
+    return [bboxes[i] for i in keep]
+
+
 def _preprocess_image(image: np.ndarray) -> Tuple[torch.Tensor, float]:
     """Normalize, resize-and-pad to [1, 3, 1024, 1024] (zero-shot mode, no exemplar bboxes)."""
     tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
@@ -195,6 +237,12 @@ def _run_inference(
 
     # Convert SAM bboxes back to original image coordinates
     exemplar_bboxes_orig = (exemplar_bboxes_px / scale_zs).cpu().tolist()
+
+    # Remove outlier exemplars (e.g. "hole" vs "whole object" with very different sizes)
+    exemplar_bboxes_orig = _filter_exemplars_by_area(exemplar_bboxes_orig)
+
+    if not exemplar_bboxes_orig:
+        return [], 0, []
 
     # --- Pass 2: adaptive re-preprocessing + detection ---
     img_tensor, bboxes_scaled, scale = _preprocess_image_with_bboxes(image, exemplar_bboxes_orig)
