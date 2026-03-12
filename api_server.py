@@ -24,7 +24,6 @@ import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image, ImageDraw, ImageFont
-from torchvision import transforms as T
 import torchvision.ops as ops
 
 from models.counter_infer import build_model
@@ -35,6 +34,11 @@ from utils.data import resize_and_pad
 
 # URL of the companion AODC service (override via env var for local dev)
 AODC_SERVICE_URL = os.environ.get("AODC_SERVICE_URL", "http://aodc:7861")
+PNG_COMPRESS_LEVEL = max(0, min(9, int(os.environ.get("PNG_COMPRESS_LEVEL", "1"))))
+DEFAULT_IMAGE_FORMAT = os.environ.get("DEFAULT_IMAGE_FORMAT", "jpeg").lower()
+DEFAULT_IMAGE_MAX_SIDE = max(0, int(os.environ.get("DEFAULT_IMAGE_MAX_SIDE", "1280")))
+DEFAULT_IMAGE_QUALITY = max(1, min(100, int(os.environ.get("DEFAULT_IMAGE_QUALITY", "85"))))
+_SUPPORTED_IMAGE_FORMATS = {"png", "jpeg", "webp"}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -44,6 +48,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _pipeline: Optional[PointToCountPipeline] = None
 _device: Optional[torch.device] = None
+_aodc_client: Optional[httpx.AsyncClient] = None
+_NORM_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+_NORM_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
 
 def _inference_autocast():
@@ -75,15 +82,19 @@ def _load_pipeline(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load SAM2+GECO2 pipeline once at startup."""
-    global _pipeline, _device
+    global _pipeline, _device, _aodc_client
     logger.info("Loading SAM2+GECO2 pipeline …")
     _pipeline, _device = _load_pipeline()
+    _aodc_client = httpx.AsyncClient(timeout=30.0)
     if _device.type == "cuda":
         torch.backends.cuda.enable_flash_sdp(True)
         torch.backends.cuda.enable_mem_efficient_sdp(True)
     logger.info("Pipeline ready on %s", _device)
     logger.info("Auto-count will call AODC service at %s", AODC_SERVICE_URL)
     yield
+    if _aodc_client is not None:
+        await _aodc_client.aclose()
+        _aodc_client = None
     logger.info("Shutting down.")
 
 
@@ -258,10 +269,52 @@ def _filter_aodc_points_by_area(
     )
 
 
+async def _request_aodc_predict_multi(contents: bytes, filename: str) -> dict:
+    """Call AODC /predict_multi using a shared AsyncClient."""
+    if _aodc_client is None:
+        raise HTTPException(status_code=503, detail="AODC client is not initialized")
+
+    try:
+        resp = await _aodc_client.post(
+            f"{AODC_SERVICE_URL}/predict_multi",
+            files={"image": (filename, contents, "image/jpeg")},
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail=f"AODC service unreachable at {AODC_SERVICE_URL}. Is the aodc container running?",
+        )
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"AODC service returned error: {e.response.status_code} {e.response.text}",
+        )
+
+
+def _normalize_chw_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """In-place ImageNet normalization for CHW float tensor in [0,1]."""
+    return tensor.sub_(_NORM_MEAN).div_(_NORM_STD)
+
+
+async def _read_upload_image(image: UploadFile) -> Tuple[bytes, Image.Image, np.ndarray]:
+    """Decode uploaded image once and return bytes, PIL(RGB), numpy(HWC uint8)."""
+    try:
+        contents = await image.read()
+        pil = Image.open(io.BytesIO(contents)).convert("RGB")
+        image_np = np.asarray(pil, dtype=np.uint8)
+        if not image_np.flags["C_CONTIGUOUS"]:
+            image_np = np.ascontiguousarray(image_np)
+        return contents, pil, image_np
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
+
+
 def _preprocess_image(image: np.ndarray) -> Tuple[torch.Tensor, float]:
     """Normalize, resize-and-pad to [1, 3, 1024, 1024] (zero-shot mode, no exemplar bboxes)."""
-    tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
-    tensor = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(tensor)
+    tensor = torch.from_numpy(image).permute(2, 0, 1).to(dtype=torch.float32).div_(255.0)
+    tensor = _normalize_chw_tensor(tensor)
     dummy_bbox = torch.tensor([[0, 0, 1, 1]], dtype=torch.float32)
     padded, _, scale = resize_and_pad(tensor, dummy_bbox, size=1024.0, zero_shot=True)
     return padded.unsqueeze(0).to(_device), scale
@@ -276,8 +329,8 @@ def _preprocess_image_with_bboxes(
     Uses adaptive scaling (zero_shot=False) so that exemplar objects are ~80px.
     Returns bboxes in pixel coordinates of the padded 1024px image.
     """
-    tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
-    tensor = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(tensor)
+    tensor = torch.from_numpy(image).permute(2, 0, 1).to(dtype=torch.float32).div_(255.0)
+    tensor = _normalize_chw_tensor(tensor)
     bboxes_tensor = torch.tensor(bboxes, dtype=torch.float32)
     padded, bboxes_scaled, scale = resize_and_pad(tensor, bboxes_tensor, size=1024.0)
     img_tensor = padded.unsqueeze(0).to(_device)
@@ -292,6 +345,7 @@ def _run_inference(
     labels: List[int],
     threshold: float = 0.33,
     expected_areas: Optional[List[float]] = None,
+    need_masks: bool = True,
 ):
     """Core inference: image + points → boxes + count (two-pass with adaptive scaling).
 
@@ -388,17 +442,19 @@ def _run_inference(
     final_boxes = pred_boxes[sel][keep]
     final_boxes = torch.clamp(final_boxes, 0, 1)
 
-    # SAM2 masks on detected boxes (in 1024 space)
-    boxes_1024 = final_boxes * image_size  # [0,1] → pixel in 1024-padded image
     final_boxes_orig_t = final_boxes / scale * image_size
-    masks_np = _generate_detection_masks(
-        backbone_feats=feats,
-        final_boxes_1024=boxes_1024,
-        final_boxes_orig=final_boxes_orig_t,
-        scale=scale,
-        orig_h=image.shape[0],
-        orig_w=image.shape[1],
-    )
+    masks_np = None
+    if need_masks:
+        # SAM2 masks on detected boxes (in 1024 space)
+        boxes_1024 = final_boxes * image_size  # [0,1] → pixel in 1024-padded image
+        masks_np = _generate_detection_masks(
+            backbone_feats=feats,
+            final_boxes_1024=boxes_1024,
+            final_boxes_orig=final_boxes_orig_t,
+            scale=scale,
+            orig_h=image.shape[0],
+            orig_w=image.shape[1],
+        )
 
     final_boxes = final_boxes_orig_t.cpu().tolist()
 
@@ -410,6 +466,7 @@ def _run_inference_bbox(
     image: np.ndarray,
     bboxes: List[List[float]],
     threshold: float = 0.33,
+    need_masks: bool = True,
 ):
     """Core inference with explicit exemplar bounding boxes (no SAM2 preprocessing).
 
@@ -443,17 +500,19 @@ def _run_inference_bbox(
     final_boxes = pred_boxes_raw[sel][keep]
     final_boxes = torch.clamp(final_boxes, 0, 1)
 
-    # SAM2 masks on detected boxes (in 1024 space)
-    boxes_1024 = final_boxes * image_size
     final_boxes_orig_t = final_boxes / scale * image_size
-    masks_np = _generate_detection_masks(
-        backbone_feats=feats,
-        final_boxes_1024=boxes_1024,
-        final_boxes_orig=final_boxes_orig_t,
-        scale=scale,
-        orig_h=image.shape[0],
-        orig_w=image.shape[1],
-    )
+    masks_np = None
+    if need_masks:
+        # SAM2 masks on detected boxes (in 1024 space)
+        boxes_1024 = final_boxes * image_size
+        masks_np = _generate_detection_masks(
+            backbone_feats=feats,
+            final_boxes_1024=boxes_1024,
+            final_boxes_orig=final_boxes_orig_t,
+            scale=scale,
+            orig_h=image.shape[0],
+            orig_w=image.shape[1],
+        )
 
     final_boxes = final_boxes_orig_t.cpu().tolist()
 
@@ -548,12 +607,13 @@ def _draw_boxes(
 
     # Draw semi-transparent mask overlay
     if masks is not None and len(masks) > 0:
-        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        overlay_np = np.array(overlay)
         combined = np.any(masks, axis=0)  # [H, W]
-        overlay_np[combined] = (60, 220, 60, 80)  # green, alpha=80/255
-        overlay = Image.fromarray(overlay_np, "RGBA")
-        img = Image.alpha_composite(img, overlay)
+        if combined.any():
+            # Build an alpha mask directly to avoid large RGBA numpy round-trips.
+            alpha = Image.fromarray((combined.astype(np.uint8) * 80), mode="L")
+            overlay = Image.new("RGBA", img.size, (60, 220, 60, 0))
+            overlay.putalpha(alpha)
+            img = Image.alpha_composite(img, overlay)
 
     img = img.convert("RGB")
     draw = ImageDraw.Draw(img)
@@ -581,11 +641,45 @@ def _draw_boxes(
     return img
 
 
-def _image_response(pil_image: Image.Image) -> StreamingResponse:
+def _image_response(
+    pil_image: Image.Image,
+    response_format: str = DEFAULT_IMAGE_FORMAT,
+    max_side: int = DEFAULT_IMAGE_MAX_SIDE,
+    quality: int = DEFAULT_IMAGE_QUALITY,
+) -> StreamingResponse:
+    response_format = (response_format or DEFAULT_IMAGE_FORMAT).lower()
+    if response_format not in _SUPPORTED_IMAGE_FORMATS:
+        raise HTTPException(status_code=400, detail=f"Unsupported image format: {response_format}")
+
+    quality = max(1, min(100, int(quality)))
+    max_side = max(0, int(max_side))
+
+    img_out = pil_image
+    if max_side > 0:
+        w, h = img_out.size
+        longer = max(w, h)
+        if longer > max_side:
+            scale = max_side / float(longer)
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            img_out = img_out.resize((new_w, new_h), Image.Resampling.BILINEAR)
+
     buf = io.BytesIO()
-    pil_image.save(buf, format="PNG")
+    if response_format == "png":
+        img_out.save(buf, format="PNG", compress_level=PNG_COMPRESS_LEVEL, optimize=False)
+        media_type = "image/png"
+    elif response_format == "jpeg":
+        img_out.convert("RGB").save(
+            buf, format="JPEG", quality=quality, optimize=False, progressive=False
+        )
+        media_type = "image/jpeg"
+    else:  # webp
+        img_out.convert("RGB").save(
+            buf, format="WEBP", quality=quality, method=4
+        )
+        media_type = "image/webp"
     buf.seek(0)
-    return StreamingResponse(buf, media_type="image/png")
+    return StreamingResponse(buf, media_type=media_type)
 
 
 
@@ -657,7 +751,7 @@ async def predict(
 
     # --- Inference ---
     pred_boxes, count, exemplar_boxes, _masks = _run_inference(
-        image_np, points_list, labels_list, threshold=threshold,
+        image_np, points_list, labels_list, threshold=threshold, need_masks=False,
     )
 
     return JSONResponse({
@@ -676,6 +770,10 @@ async def predict_image(
         description='JSON array of labels (1=foreground, 0=background). Defaults to all foreground.',
     ),
     threshold: float = Form(default=0.33, description="Detection confidence threshold (0.05–0.95)"),
+    with_masks: bool = Form(default=False, description="If true, overlays SAM2 masks on output image."),
+    response_format: str = Form(default=DEFAULT_IMAGE_FORMAT, description="Response format: png|jpeg|webp."),
+    max_side: int = Form(default=DEFAULT_IMAGE_MAX_SIDE, description="Resize output image so longest side <= max_side. 0 disables."),
+    quality: int = Form(default=DEFAULT_IMAGE_QUALITY, description="JPEG/WEBP quality (1-100)."),
 ):
     """Same as /predict but returns a PNG image with bounding boxes drawn on it.
 
@@ -703,17 +801,17 @@ async def predict_image(
     else:
         labels_list = [1] * len(points_list)
 
-    try:
-        contents = await image.read()
-        pil = Image.open(io.BytesIO(contents)).convert("RGB")
-        image_np = np.array(pil)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
+    _contents, pil, image_np = await _read_upload_image(image)
 
     pred_boxes, count, exemplar_boxes, masks = _run_inference(
-        image_np, points_list, labels_list, threshold=threshold,
+        image_np, points_list, labels_list, threshold=threshold, need_masks=with_masks,
     )
-    return _image_response(_draw_boxes(pil, pred_boxes, exemplar_boxes, count, masks=masks))
+    return _image_response(
+        _draw_boxes(pil, pred_boxes, exemplar_boxes, count, masks=masks),
+        response_format=response_format,
+        max_side=max_side,
+        quality=quality,
+    )
 
 
 @app.post("/predict_auto")
@@ -739,40 +837,19 @@ async def predict_auto(
     }
     ```
     """
-    try:
-        contents = await image.read()
-        pil = Image.open(io.BytesIO(contents)).convert("RGB")
-        image_np = np.array(pil)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
+    contents, _pil, image_np = await _read_upload_image(image)
 
     # --- Call AODC service to get multiple seed points ---
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{AODC_SERVICE_URL}/predict_multi",
-                files={"image": (image.filename or "image.jpg", contents, "image/jpeg")},
-            )
-            resp.raise_for_status()
-            aodc_result = resp.json()
-    except httpx.ConnectError:
-        raise HTTPException(
-            status_code=503,
-            detail=f"AODC service unreachable at {AODC_SERVICE_URL}. "
-                   "Is the aodc container running?",
-        )
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"AODC service returned error: {e.response.status_code} {e.response.text}",
-        )
+    aodc_result = await _request_aodc_predict_multi(contents, image.filename or "image.jpg")
 
     points = aodc_result.get("points", [])
     if not points:
         return JSONResponse({"count": 0, "pred_boxes": [], "exemplar_boxes": []})
 
-    # Decode density map and estimate per-object areas
-    expected_areas = _decode_aodc_areas(aodc_result, image_np.shape[0], image_np.shape[1])
+    # Decode density map only when multiple seeds exist (single-point case doesn't need area filtering).
+    expected_areas = None
+    if len(points) > 1:
+        expected_areas = _decode_aodc_areas(aodc_result, image_np.shape[0], image_np.shape[1])
 
     # Pre-filter: remove small-hole peaks before SAM2
     if expected_areas is not None:
@@ -788,6 +865,7 @@ async def predict_auto(
         labels=[1] * len(points),
         threshold=threshold,
         expected_areas=expected_areas,
+        need_masks=False,
     )
 
     return JSONResponse({
@@ -801,6 +879,10 @@ async def predict_auto(
 async def predict_auto_image(
     image: UploadFile = File(..., description="Input image (JPEG/PNG)"),
     threshold: float = Form(default=0.33, description="Detection confidence threshold (0.05–0.95)"),
+    with_masks: bool = Form(default=False, description="If true, overlays SAM2 masks on output image."),
+    response_format: str = Form(default=DEFAULT_IMAGE_FORMAT, description="Response format: png|jpeg|webp."),
+    max_side: int = Form(default=DEFAULT_IMAGE_MAX_SIDE, description="Resize output image so longest side <= max_side. 0 disables."),
+    quality: int = Form(default=DEFAULT_IMAGE_QUALITY, description="JPEG/WEBP quality (1-100)."),
 ):
     """Same as /predict_auto but returns a PNG image with bounding boxes drawn on it.
 
@@ -808,38 +890,18 @@ async def predict_auto_image(
     - Red boxes: exemplar (query) objects
     - Count label in top-left corner
     """
-    try:
-        contents = await image.read()
-        pil = Image.open(io.BytesIO(contents)).convert("RGB")
-        image_np = np.array(pil)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
+    contents, pil, image_np = await _read_upload_image(image)
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{AODC_SERVICE_URL}/predict_multi",
-                files={"image": (image.filename or "image.jpg", contents, "image/jpeg")},
-            )
-            resp.raise_for_status()
-            aodc_result = resp.json()
-    except httpx.ConnectError:
-        raise HTTPException(
-            status_code=503,
-            detail=f"AODC service unreachable at {AODC_SERVICE_URL}. Is the aodc container running?",
-        )
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"AODC service returned error: {e.response.status_code} {e.response.text}",
-        )
+    aodc_result = await _request_aodc_predict_multi(contents, image.filename or "image.jpg")
 
     points = aodc_result.get("points", [])
     if not points:
         return _image_response(_draw_boxes(pil, [], [], 0))
 
-    # Decode density map and estimate per-object areas
-    expected_areas = _decode_aodc_areas(aodc_result, image_np.shape[0], image_np.shape[1])
+    # Decode density map only when multiple seeds exist (single-point case doesn't need area filtering).
+    expected_areas = None
+    if len(points) > 1:
+        expected_areas = _decode_aodc_areas(aodc_result, image_np.shape[0], image_np.shape[1])
 
     # Pre-filter: remove small-hole peaks before SAM2
     if expected_areas is not None:
@@ -850,9 +912,14 @@ async def predict_auto_image(
 
     pred_boxes, count, exemplar_boxes, masks = _run_inference(
         image_np, points=points, labels=[1] * len(points), threshold=threshold,
-        expected_areas=expected_areas,
+        expected_areas=expected_areas, need_masks=with_masks,
     )
-    return _image_response(_draw_boxes(pil, pred_boxes, exemplar_boxes, count, masks=masks))
+    return _image_response(
+        _draw_boxes(pil, pred_boxes, exemplar_boxes, count, masks=masks),
+        response_format=response_format,
+        max_side=max_side,
+        quality=quality,
+    )
 
 
 @app.post("/predict_bbox")
@@ -889,14 +956,11 @@ async def predict_bbox(
     if not bboxes_list or not all(len(b) == 4 for b in bboxes_list):
         raise HTTPException(status_code=400, detail="bboxes must be a non-empty array of [x1, y1, x2, y2]")
 
-    try:
-        contents = await image.read()
-        pil = Image.open(io.BytesIO(contents)).convert("RGB")
-        image_np = np.array(pil)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
+    _contents, _pil, image_np = await _read_upload_image(image)
 
-    pred_boxes, count, exemplar_boxes, _masks = _run_inference_bbox(image_np, bboxes_list, threshold=threshold)
+    pred_boxes, count, exemplar_boxes, _masks = _run_inference_bbox(
+        image_np, bboxes_list, threshold=threshold, need_masks=False
+    )
     return JSONResponse({"count": count, "pred_boxes": pred_boxes, "exemplar_boxes": exemplar_boxes})
 
 
@@ -905,6 +969,10 @@ async def predict_bbox_image(
     image: UploadFile = File(..., description="Input image (JPEG/PNG)"),
     bboxes: str = Form(..., description='JSON array of exemplar bboxes [[x1,y1,x2,y2], ...] in original image pixel coordinates'),
     threshold: float = Form(default=0.33, description="Detection confidence threshold (0.05–0.95)"),
+    with_masks: bool = Form(default=False, description="If true, overlays SAM2 masks on output image."),
+    response_format: str = Form(default=DEFAULT_IMAGE_FORMAT, description="Response format: png|jpeg|webp."),
+    max_side: int = Form(default=DEFAULT_IMAGE_MAX_SIDE, description="Resize output image so longest side <= max_side. 0 disables."),
+    quality: int = Form(default=DEFAULT_IMAGE_QUALITY, description="JPEG/WEBP quality (1-100)."),
 ):
     """Same as /predict_bbox but returns a PNG image with bounding boxes drawn on it."""
     import json as _json
@@ -916,15 +984,17 @@ async def predict_bbox_image(
     if not bboxes_list or not all(len(b) == 4 for b in bboxes_list):
         raise HTTPException(status_code=400, detail="bboxes must be a non-empty array of [x1, y1, x2, y2]")
 
-    try:
-        contents = await image.read()
-        pil = Image.open(io.BytesIO(contents)).convert("RGB")
-        image_np = np.array(pil)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
+    _contents, pil, image_np = await _read_upload_image(image)
 
-    pred_boxes, count, exemplar_boxes, masks = _run_inference_bbox(image_np, bboxes_list, threshold=threshold)
-    return _image_response(_draw_boxes(pil, pred_boxes, exemplar_boxes, count, masks=masks))
+    pred_boxes, count, exemplar_boxes, masks = _run_inference_bbox(
+        image_np, bboxes_list, threshold=threshold, need_masks=with_masks
+    )
+    return _image_response(
+        _draw_boxes(pil, pred_boxes, exemplar_boxes, count, masks=masks),
+        response_format=response_format,
+        max_side=max_side,
+        quality=quality,
+    )
 
 
 # ---------------------------------------------------------------------------

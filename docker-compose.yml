@@ -45,6 +45,9 @@ services:
     image: geco2:latest
     container_name: geco2
     restart: unless-stopped
+    env_file:
+      - path: ./.env
+        required: false
     environment:
       # Tell geco2 where AODC lives (resolved via Docker network alias)
       - AODC_SERVICE_URL=http://aodc:7861
