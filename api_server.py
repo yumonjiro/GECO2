@@ -1,10 +1,11 @@
-"""FastAPI server for GECO2 (SAM2 + GECO2) point-to-count inference.
+"""FastAPI server for GECO2 (AODC + SAM2 + GECO2) point-to-count inference.
 
 Accepts an image and point prompts via HTTP, runs SAM2 mask generation + GECO2 counting,
 and returns detection results.
 
-For fully automatic counting (no user points), this service delegates point extraction
-to the AODC service configured via AODC_SERVICE_URL (default: http://aodc:7861).
+For fully automatic counting (no user points), the in-process AODC model extracts seed
+points from a density map.  The AODC checkpoint path is configured via AODC_CHECKPOINT
+(default: aodc.pth).
 
 Usage:
     python api_server.py
@@ -18,7 +19,6 @@ import os
 from contextlib import asynccontextmanager, nullcontext
 from typing import List, Optional, Tuple
 
-import httpx
 import numpy as np
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -28,12 +28,13 @@ import torchvision.ops as ops
 
 from models.counter_infer import build_model
 from utils.area_estimation import estimate_object_areas
+from models.aodc_wrapper import AODCWrapper
 from models.point_to_count import PointToCountPipeline
 from utils.arg_parser import get_argparser
 from utils.data import resize_and_pad
 
-# URL of the companion AODC service (override via env var for local dev)
-AODC_SERVICE_URL = os.environ.get("AODC_SERVICE_URL", "http://aodc:7861")
+# Path to the AODC checkpoint (override via env var)
+AODC_CHECKPOINT = os.environ.get("AODC_CHECKPOINT", "aodc.pth")
 PNG_COMPRESS_LEVEL = max(0, min(9, int(os.environ.get("PNG_COMPRESS_LEVEL", "1"))))
 DEFAULT_IMAGE_FORMAT = os.environ.get("DEFAULT_IMAGE_FORMAT", "jpeg").lower()
 DEFAULT_IMAGE_MAX_SIDE = max(0, int(os.environ.get("DEFAULT_IMAGE_MAX_SIDE", "1280")))
@@ -48,7 +49,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _pipeline: Optional[PointToCountPipeline] = None
 _device: Optional[torch.device] = None
-_aodc_client: Optional[httpx.AsyncClient] = None
+_aodc: Optional[AODCWrapper] = None
 _NORM_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 _NORM_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
@@ -81,20 +82,19 @@ def _load_pipeline(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load SAM2+GECO2 pipeline once at startup."""
-    global _pipeline, _device, _aodc_client
+    """Load AODC + SAM2 + GECO2 models once at startup."""
+    global _pipeline, _device, _aodc
     logger.info("Loading SAM2+GECO2 pipeline …")
     _pipeline, _device = _load_pipeline()
-    _aodc_client = httpx.AsyncClient(timeout=30.0)
     if _device.type == "cuda":
         torch.backends.cuda.enable_flash_sdp(True)
         torch.backends.cuda.enable_mem_efficient_sdp(True)
     logger.info("Pipeline ready on %s", _device)
-    logger.info("Auto-count will call AODC service at %s", AODC_SERVICE_URL)
+    logger.info("Loading AODC from '%s' …", AODC_CHECKPOINT)
+    _aodc = AODCWrapper(AODC_CHECKPOINT, _device)
+    logger.info("AODC loaded in-process on %s", _device)
     yield
-    if _aodc_client is not None:
-        await _aodc_client.aclose()
-        _aodc_client = None
+    _aodc = None
     logger.info("Shutting down.")
 
 
@@ -113,21 +113,15 @@ app = FastAPI(
 def _decode_aodc_areas(
     aodc_result: dict, orig_h: int, orig_w: int,
 ) -> Optional[List[float]]:
-    """Decode AODC response and estimate per-peak object areas.
+    """Estimate per-peak object areas from AODC density map.
 
-    Returns None if the response doesn't contain density map data
-    (backward compatible with older AODC servers).
+    Returns None if the result doesn't contain density map data.
     """
-    import base64
-
-    den_b64 = aodc_result.get("density_map_b64")
+    density_map = aodc_result.get("density_map")
     peak_indices = aodc_result.get("peak_indices")
-    den_shape = aodc_result.get("den_shape")
-    if not den_b64 or not peak_indices or not den_shape:
+    if density_map is None or not peak_indices:
         return None
 
-    den_bytes = base64.b64decode(den_b64)
-    density_map = np.frombuffer(den_bytes, dtype=np.float32).reshape(den_shape)
     return estimate_object_areas(
         density_map,
         peak_indices=[(r, c) for r, c in peak_indices],
@@ -269,28 +263,14 @@ def _filter_aodc_points_by_area(
     )
 
 
-async def _request_aodc_predict_multi(contents: bytes, filename: str) -> dict:
-    """Call AODC /predict_multi using a shared AsyncClient."""
-    if _aodc_client is None:
-        raise HTTPException(status_code=503, detail="AODC client is not initialized")
+def _call_aodc_multi(image_np: np.ndarray) -> dict:
+    """Run AODC density-peak extraction in-process.
 
-    try:
-        resp = await _aodc_client.post(
-            f"{AODC_SERVICE_URL}/predict_multi",
-            files={"image": (filename, contents, "image/jpeg")},
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except httpx.ConnectError:
-        raise HTTPException(
-            status_code=503,
-            detail=f"AODC service unreachable at {AODC_SERVICE_URL}. Is the aodc container running?",
-        )
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"AODC service returned error: {e.response.status_code} {e.response.text}",
-        )
+    Returns dict with keys: points, peak_indices, density_map (ndarray).
+    """
+    if _aodc is None:
+        raise HTTPException(status_code=503, detail="AODC model is not loaded")
+    return _aodc.run_multi(image_np)
 
 
 def _normalize_chw_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -895,8 +875,8 @@ async def predict_auto(
 ):
     """Run fully automatic counting — no point prompts needed.
 
-    Delegates point extraction to the AODC service (AODC_SERVICE_URL), then
-    runs the local SAM2+GECO2 pipeline with that seed point.
+    Uses the in-process AODC model for seed point extraction, then
+    runs the SAM2+GECO2 pipeline with those seed points.
 
     **Request** (multipart/form-data):
     - `image`: image file
@@ -911,10 +891,10 @@ async def predict_auto(
     }
     ```
     """
-    contents, _pil, image_np = await _read_upload_image(image)
+    _contents, _pil, image_np = await _read_upload_image(image)
 
-    # --- Call AODC service to get multiple seed points ---
-    aodc_result = await _request_aodc_predict_multi(contents, image.filename or "image.jpg")
+    # --- Run AODC in-process to get multiple seed points ---
+    aodc_result = _call_aodc_multi(image_np)
 
     points = aodc_result.get("points", [])
     if not points:
@@ -964,9 +944,9 @@ async def predict_auto_image(
     - Red boxes: exemplar (query) objects
     - Count label in top-left corner
     """
-    contents, pil, image_np = await _read_upload_image(image)
+    _contents, pil, image_np = await _read_upload_image(image)
 
-    aodc_result = await _request_aodc_predict_multi(contents, image.filename or "image.jpg")
+    aodc_result = _call_aodc_multi(image_np)
 
     points = aodc_result.get("points", [])
     if not points:
